@@ -25,47 +25,51 @@ CIFAR100_SUPERCLASSES = [
 
 # --- Multi-Channel PDE Diffusion Layer for CIFAR ---
 class CIFARDiffusionLayer(nn.Module):
-    def __init__(self, size=32, channels=3, dt=0.15, dx=1.0, num_steps=4):
+    def __init__(self, size=32, channels=3, dt=0.05, dx=1.0, num_steps=3, use_implicit=True):
         super().__init__()
         self.size = size
         self.channels = channels
         self.dt = dt
         self.dx = dx
         self.num_steps = num_steps
+        self.use_implicit = use_implicit
 
-        # Per-channel diffusion coefficients as matrices (learnable)
-        self.alpha_base = nn.Parameter(torch.ones(channels, size, size) * 1.2)
-        self.beta_base = nn.Parameter(torch.ones(channels, size, size) * 1.2)
+        # Simplified coefficients for stability - per channel scalars
+        self.alpha_base = nn.Parameter(torch.ones(channels) * 0.3)  # Smaller initial values
+        self.beta_base = nn.Parameter(torch.ones(channels) * 0.3)
 
-        # Time-dependent modulation parameters as matrices (learnable)
-        self.alpha_time_coeff = nn.Parameter(torch.zeros(channels, size, size))
-        self.beta_time_coeff = nn.Parameter(torch.zeros(channels, size, size))
+        # Optional spatial variation (but much smaller)
+        self.alpha_spatial = nn.Parameter(torch.zeros(channels, size, size) * 0.01)
+        self.beta_spatial = nn.Parameter(torch.zeros(channels, size, size) * 0.01)
 
         # Cross-channel coupling for RGB interactions
-        self.channel_coupling = nn.Parameter(torch.eye(channels) * 0.1)
+        self.channel_coupling = nn.Parameter(torch.eye(channels) * 0.05)
 
         # Stability parameters
         self.stability_eps = 1e-6
+        self.max_coeff = 0.25 if not use_implicit else 1.0
 
     def get_alpha_beta_at_time(self, t, channel=None):
-        """Get alpha and beta coefficient matrices at time t for specific channel"""
+        """Get alpha and beta coefficient scalars at time t for specific channel"""
         if channel is None:
-            alpha_t = self.alpha_base + self.alpha_time_coeff * t
-            beta_t = self.beta_base + self.beta_time_coeff * t
+            # Return all channels
+            alpha_t = self.alpha_base + self.alpha_spatial.mean(dim=(1,2)) * t
+            beta_t = self.beta_base + self.beta_spatial.mean(dim=(1,2)) * t
         else:
-            alpha_t = self.alpha_base[channel] + self.alpha_time_coeff[channel] * t
-            beta_t = self.beta_base[channel] + self.beta_time_coeff[channel] * t
+            # Return specific channel
+            alpha_t = self.alpha_base[channel] + self.alpha_spatial[channel].mean() * t
+            beta_t = self.beta_base[channel] + self.beta_spatial[channel].mean() * t
 
         # Ensure positive coefficients for stability
-        alpha_t = torch.clamp(alpha_t, min=self.stability_eps)
-        beta_t = torch.clamp(beta_t, min=self.stability_eps)
+        alpha_t = torch.clamp(alpha_t, min=self.stability_eps, max=self.max_coeff)
+        beta_t = torch.clamp(beta_t, min=self.stability_eps, max=self.max_coeff)
 
         return alpha_t, beta_t
 
     def forward(self, u):
         B, C, H, W = u.shape
         
-        # Process each channel with time-dependent coefficients
+        # Process each diffusion step
         current_time = 0.0
         
         for step in range(self.num_steps):
@@ -78,10 +82,12 @@ class CIFARDiffusionLayer(nn.Module):
                 # Extract single channel
                 u_c = u[:, c, :, :]
                 
-                # Strang splitting: half step x, full step y, half step x
-                u_c = self.diffuse_x_vectorized(u_c, alpha_t, self.dt / 2, self.dx)
-                u_c = self.diffuse_y_vectorized(u_c, beta_t, self.dt, self.dx)
-                u_c = self.diffuse_x_vectorized(u_c, alpha_t, self.dt / 2, self.dx)
+                if self.use_implicit:
+                    # Use ADI (Alternating Direction Implicit) method
+                    u_c = self.adi_diffusion_step(u_c, alpha_t, beta_t)
+                else:
+                    # Use explicit finite differences (with stability check)
+                    u_c = self.explicit_diffusion_step(u_c, alpha_t, beta_t)
                 
                 u_new[:, c, :, :] = u_c
             
@@ -90,6 +96,132 @@ class CIFARDiffusionLayer(nn.Module):
             current_time += self.dt
 
         return u
+
+    def explicit_diffusion_step(self, u, alpha_coeff, beta_coeff):
+        """Explicit finite difference diffusion step (no conv2d!)"""
+        B, H, W = u.shape
+        
+        # Ensure stability for explicit scheme
+        alpha_coeff = torch.clamp(alpha_coeff, max=0.25)
+        beta_coeff = torch.clamp(beta_coeff, max=0.25)
+        
+        # Apply x-direction diffusion
+        u = self.diffuse_x_explicit(u, alpha_coeff)
+        
+        # Apply y-direction diffusion
+        u = self.diffuse_y_explicit(u, beta_coeff)
+        
+        return u
+    
+    def diffuse_x_explicit(self, u, coeff):
+        """Explicit finite difference in x-direction"""
+        B, H, W = u.shape
+        u_new = u.clone()
+        
+        # Interior points: central difference
+        if W > 2:
+            u_new[:, :, 1:-1] = u[:, :, 1:-1] + coeff * self.dt * (
+                u[:, :, 0:-2] - 2 * u[:, :, 1:-1] + u[:, :, 2:]
+            ) / (self.dx ** 2)
+        
+        # Neumann boundary conditions (zero gradient)
+        u_new[:, :, 0] = u[:, :, 0] + coeff * self.dt * (
+            u[:, :, 1] - u[:, :, 0]
+        ) / (self.dx ** 2)
+        
+        u_new[:, :, -1] = u[:, :, -1] + coeff * self.dt * (
+            u[:, :, -2] - u[:, :, -1]
+        ) / (self.dx ** 2)
+        
+        return u_new
+    
+    def diffuse_y_explicit(self, u, coeff):
+        """Explicit finite difference in y-direction"""
+        B, H, W = u.shape
+        u_new = u.clone()
+        
+        # Interior points: central difference
+        if H > 2:
+            u_new[:, 1:-1, :] = u[:, 1:-1, :] + coeff * self.dt * (
+                u[:, 0:-2, :] - 2 * u[:, 1:-1, :] + u[:, 2:, :]
+            ) / (self.dx ** 2)
+        
+        # Neumann boundary conditions (zero gradient)
+        u_new[:, 0, :] = u[:, 0, :] + coeff * self.dt * (
+            u[:, 1, :] - u[:, 0, :]
+        ) / (self.dx ** 2)
+        
+        u_new[:, -1, :] = u[:, -1, :] + coeff * self.dt * (
+            u[:, -2, :] - u[:, -1, :]
+        ) / (self.dx ** 2)
+        
+        return u_new
+    
+    def adi_diffusion_step(self, u, alpha_coeff, beta_coeff):
+        """ADI (Alternating Direction Implicit) diffusion step"""
+        # Step 1: Implicit in x-direction, explicit in y-direction
+        u_half = self.solve_implicit_x(u, alpha_coeff, self.dt/2)
+        
+        # Step 2: Implicit in y-direction, explicit in x-direction
+        u_new = self.solve_implicit_y(u_half, beta_coeff, self.dt/2)
+        
+        return u_new
+    
+    def solve_implicit_x(self, u, coeff, dt):
+        """Solve implicit diffusion in x-direction using tridiagonal solver"""
+        B, H, W = u.shape
+        
+        # Set up coefficients for implicit scheme
+        r = coeff * dt / (self.dx ** 2)
+        
+        u_new = torch.zeros_like(u)
+        
+        for h in range(H):
+            # Extract row
+            row = u[:, h, :]  # Shape: (B, W)
+            
+            # Tridiagonal system: -r*u[i-1] + (1+2r)*u[i] - r*u[i+1] = u_old[i]
+            a = torch.full((B, W), -r, device=u.device)  # sub-diagonal
+            b = torch.full((B, W), 1 + 2*r, device=u.device)  # main diagonal
+            c = torch.full((B, W), -r, device=u.device)  # super-diagonal
+            
+            # Boundary conditions (Neumann)
+            b[:, 0] = 1 + r
+            b[:, -1] = 1 + r
+            
+            # Solve tridiagonal system
+            solution = self.thomas_solver_batch(a, b, c, row)
+            u_new[:, h, :] = solution
+        
+        return u_new
+    
+    def solve_implicit_y(self, u, coeff, dt):
+        """Solve implicit diffusion in y-direction using tridiagonal solver"""
+        B, H, W = u.shape
+        
+        # Set up coefficients for implicit scheme
+        r = coeff * dt / (self.dx ** 2)
+        
+        u_new = torch.zeros_like(u)
+        
+        for w in range(W):
+            # Extract column
+            col = u[:, :, w]  # Shape: (B, H)
+            
+            # Tridiagonal system
+            a = torch.full((B, H), -r, device=u.device)  # sub-diagonal
+            b = torch.full((B, H), 1 + 2*r, device=u.device)  # main diagonal
+            c = torch.full((B, H), -r, device=u.device)  # super-diagonal
+            
+            # Boundary conditions (Neumann)
+            b[:, 0] = 1 + r
+            b[:, -1] = 1 + r
+            
+            # Solve tridiagonal system
+            solution = self.thomas_solver_batch(a, b, c, col)
+            u_new[:, :, w] = solution
+        
+        return u_new
 
     def apply_channel_coupling(self, u):
         """Apply learnable cross-channel coupling"""
@@ -101,121 +233,38 @@ class CIFARDiffusionLayer(nn.Module):
         
         return u_coupled.view(B, C, H, W)
 
-    def diffuse_x_vectorized(self, u, alpha_matrix, dt, dx):
-        """Vectorized diffusion in x-direction"""
-        B, H, W = u.shape
-        device = u.device
-
-        # Reshape for batch processing: (B, H, W) -> (B*H, W)
-        u_flat = u.contiguous().view(B * H, W)
-
-        # Expand alpha_matrix for all batches: (H, W) -> (B*H, W)
-        alpha_expanded = alpha_matrix.unsqueeze(0).expand(B, -1, -1).contiguous().view(B * H, W)
-
-        # Apply smoothing to coefficients for stability
-        alpha_smooth = self.smooth_coefficients(alpha_expanded, dim=1)
-        coeff = alpha_smooth * dt / (dx ** 2)
-
-        # Build tridiagonal system coefficients
-        a = -coeff  # sub-diagonal
-        c = -coeff  # super-diagonal
-        b = 1 + 2 * coeff  # main diagonal
-
-        # Apply boundary conditions (Neumann - no flux at boundaries)
-        b_modified = b.clone()
-        b_modified[:, 0] = 1 + coeff[:, 0]
-        b_modified[:, -1] = 1 + coeff[:, -1]
-
-        # Solve all tridiagonal systems in parallel
-        result = self.thomas_solver_batch(a, b_modified, c, u_flat)
-
-        return result.view(B, H, W)
-
-    def diffuse_y_vectorized(self, u, beta_matrix, dt, dx):
-        """Vectorized diffusion in y-direction"""
-        B, H, W = u.shape
-        device = u.device
-
-        # Transpose to work on columns: (B, H, W) -> (B, W, H)
-        u_t = u.transpose(1, 2).contiguous()
-        u_flat = u_t.view(B * W, H)
-
-        # Expand beta_matrix for all batches: (H, W) -> (B*W, H)
-        beta_expanded = beta_matrix.t().unsqueeze(0).expand(B, -1, -1).contiguous().view(B * W, H)
-
-        # Apply smoothing to coefficients for stability
-        beta_smooth = self.smooth_coefficients(beta_expanded, dim=1)
-        coeff = beta_smooth * dt / (dx ** 2)
-
-        # Build tridiagonal system coefficients
-        a = -coeff  # sub-diagonal
-        c = -coeff  # super-diagonal
-        b = 1 + 2 * coeff  # main diagonal
-
-        # Apply boundary conditions
-        b_modified = b.clone()
-        b_modified[:, 0] = 1 + coeff[:, 0]
-        b_modified[:, -1] = 1 + coeff[:, -1]
-
-        # Solve all tridiagonal systems in parallel
-        result = self.thomas_solver_batch(a, b_modified, c, u_flat)
-
-        # Transpose back
-        return result.view(B, W, H).transpose(1, 2).contiguous()
-
-    def smooth_coefficients(self, coeffs, dim=1, kernel_size=3):
-        """Apply smoothing to coefficients for numerical stability"""
-        if kernel_size == 1:
-            return coeffs
-
-        padding = kernel_size // 2
-        if dim == 1:
-            coeffs_padded = F.pad(coeffs, (padding, padding), mode='replicate')
-            kernel = torch.ones(1, 1, kernel_size, device=coeffs.device) / kernel_size
-            smoothed = F.conv1d(coeffs_padded.unsqueeze(1), kernel, padding=0).squeeze(1)
-        else:
-            raise NotImplementedError("Only dim=1 smoothing implemented")
-
-        return smoothed
-
     def thomas_solver_batch(self, a, b, c, d):
-        """Batch Thomas algorithm for tridiagonal systems"""
-        batch_size, N = d.shape
+        """
+        Batch Thomas algorithm for solving tridiagonal systems
+        Solves: a[i]*x[i-1] + b[i]*x[i] + c[i]*x[i+1] = d[i]
+        """
+        batch_size, n = d.shape
         device = d.device
-        eps = self.stability_eps
-
-        # Initialize working arrays
-        c_star = torch.zeros_like(d)
-        d_star = torch.zeros_like(d)
-
+        
         # Forward elimination
-        denom_0 = b[:, 0] + eps
-        c_star = c_star.scatter(1, torch.zeros(batch_size, 1, dtype=torch.long, device=device),
-                               (c[:, 0] / denom_0).unsqueeze(1))
-        d_star = d_star.scatter(1, torch.zeros(batch_size, 1, dtype=torch.long, device=device),
-                               (d[:, 0] / denom_0).unsqueeze(1))
-
-        for i in range(1, N):
-            denom = b[:, i] - a[:, i] * c_star[:, i-1] + eps
-
-            if i < N-1:
-                c_star = c_star.scatter(1, torch.full((batch_size, 1), i, dtype=torch.long, device=device),
-                                       (c[:, i] / denom).unsqueeze(1))
-
-            d_val = (d[:, i] - a[:, i] * d_star[:, i-1]) / denom
-            d_star = d_star.scatter(1, torch.full((batch_size, 1), i, dtype=torch.long, device=device),
-                                   d_val.unsqueeze(1))
-
+        c_prime = torch.zeros_like(c)
+        d_prime = torch.zeros_like(d)
+        
+        # First row
+        c_prime[:, 0] = c[:, 0] / (b[:, 0] + self.stability_eps)
+        d_prime[:, 0] = d[:, 0] / (b[:, 0] + self.stability_eps)
+        
+        # Forward sweep
+        for i in range(1, n):
+            denom = b[:, i] - a[:, i] * c_prime[:, i-1]
+            denom = torch.clamp(denom, min=self.stability_eps)
+            
+            if i < n-1:
+                c_prime[:, i] = c[:, i] / denom
+            d_prime[:, i] = (d[:, i] - a[:, i] * d_prime[:, i-1]) / denom
+        
         # Back substitution
         x = torch.zeros_like(d)
-        x = x.scatter(1, torch.full((batch_size, 1), N-1, dtype=torch.long, device=device),
-                     d_star[:, -1].unsqueeze(1))
-
-        for i in range(N-2, -1, -1):
-            x_val = d_star[:, i] - c_star[:, i] * x[:, i+1]
-            x = x.scatter(1, torch.full((batch_size, 1), i, dtype=torch.long, device=device),
-                         x_val.unsqueeze(1))
-
+        x[:, -1] = d_prime[:, -1]
+        
+        for i in range(n-2, -1, -1):
+            x[:, i] = d_prime[:, i] - c_prime[:, i] * x[:, i+1]
+            
         return x
 
 
@@ -349,7 +398,7 @@ def train_cifar_model(dataset='cifar10'):
     print("Starting CIFAR PDE training...")
     import time
     
-    for epoch in range(50):  # 10 epochs for CIFAR
+    for epoch in range(10):  # 10 epochs for CIFAR
         start_time = time.time()
         model.train()
         total_loss = 0
@@ -387,9 +436,9 @@ def train_cifar_model(dataset='cifar10'):
             with torch.no_grad():
                 for c, channel_name in enumerate(['Red', 'Green', 'Blue']):
                     alpha_base = model.diff.alpha_base[c]
-                    alpha_time = model.diff.alpha_time_coeff[c]
-                    print(f"{channel_name} Channel - α_base: μ={alpha_base.mean().item():.3f}±{alpha_base.std().item():.3f}, "
-                          f"α_time: μ={alpha_time.mean().item():.4f}")
+                    alpha_spatial = model.diff.alpha_spatial[c]
+                    print(f"{channel_name} Channel - α_base: {alpha_base.item():.3f}, "
+                          f"α_spatial_std: {alpha_spatial.std().item():.4f}")
                 
                 # Channel coupling analysis
                 coupling = model.diff.channel_coupling
@@ -493,15 +542,28 @@ def evaluate_and_visualize_cifar(model, test_loader, num_classes, dataset='cifar
             plt.title("After PDE", fontsize=8)
         
         # Visualize learned diffusion coefficients
-        alpha_matrices = model.diff.alpha_base.detach().cpu().numpy()
-        channel_names = ['Red α-matrix', 'Green α-matrix', 'Blue α-matrix']
+        alpha_coeffs = model.diff.alpha_base.detach().cpu().numpy()
+        beta_coeffs = model.diff.beta_base.detach().cpu().numpy()
+        channel_names = ['Red α-coeff', 'Green α-coeff', 'Blue α-coeff']
         
-        for c in range(3):
-            plt.subplot(5, 8, 25 + c)
-            plt.imshow(alpha_matrices[c], cmap='RdBu_r', interpolation='nearest')
-            plt.colorbar(fraction=0.046, pad=0.04)
-            plt.title(channel_names[c], fontsize=9)
-            plt.axis('off')
+        # Display scalar coefficients as bar plot
+        plt.subplot(5, 8, 25)
+        plt.bar(['R', 'G', 'B'], alpha_coeffs, color=['red', 'green', 'blue'], alpha=0.7)
+        plt.title('α Coefficients', fontsize=9)
+        plt.ylabel('Value')
+        
+        plt.subplot(5, 8, 26)
+        plt.bar(['R', 'G', 'B'], beta_coeffs, color=['red', 'green', 'blue'], alpha=0.7)
+        plt.title('β Coefficients', fontsize=9)
+        plt.ylabel('Value')
+        
+        # Show spatial modulation for one channel
+        plt.subplot(5, 8, 27)
+        spatial_mod = model.diff.alpha_spatial[0].detach().cpu().numpy()  # Red channel
+        plt.imshow(spatial_mod, cmap='RdBu_r', interpolation='nearest')
+        plt.colorbar(fraction=0.046, pad=0.04)
+        plt.title('Red α Spatial Mod', fontsize=9)
+        plt.axis('off')
         
         # Cross-channel coupling matrix
         plt.subplot(5, 8, 28)
@@ -511,12 +573,12 @@ def evaluate_and_visualize_cifar(model, test_loader, num_classes, dataset='cifar
         plt.title('RGB Coupling', fontsize=9)
         plt.axis('off')
         
-        # Time evolution visualization
+        # Additional spatial modulation visualization
         plt.subplot(5, 8, 29)
-        time_coeffs = model.diff.alpha_time_coeff[0].detach().cpu().numpy()  # Red channel
-        plt.imshow(time_coeffs, cmap='RdBu_r')
+        spatial_mod_green = model.diff.beta_spatial[1].detach().cpu().numpy()  # Green channel
+        plt.imshow(spatial_mod_green, cmap='RdBu_r')
         plt.colorbar(fraction=0.046, pad=0.04)
-        plt.title('Time Evolution', fontsize=9)
+        plt.title('Green β Spatial', fontsize=9)
         plt.axis('off')
         
         plt.suptitle(f'PDE Diffusion Network on {dataset.upper()}\nMulti-Channel Diffusion with Time-Dependent Coefficients', fontsize=14)
@@ -531,10 +593,14 @@ def evaluate_and_visualize_cifar(model, test_loader, num_classes, dataset='cifar
         # Analyze parameter ranges
         for c, name in enumerate(['Red', 'Green', 'Blue']):
             alpha_base = model.diff.alpha_base[c]
-            alpha_time = model.diff.alpha_time_coeff[c]
+            beta_base = model.diff.beta_base[c]
+            alpha_spatial = model.diff.alpha_spatial[c]
+            beta_spatial = model.diff.beta_spatial[c]
             print(f"{name} Channel:")
-            print(f"  α_base range: [{alpha_base.min().item():.3f}, {alpha_base.max().item():.3f}]")
-            print(f"  α_time range: [{alpha_time.min().item():.4f}, {alpha_time.max().item():.4f}]")
+            print(f"  α_base: {alpha_base.item():.3f}")
+            print(f"  β_base: {beta_base.item():.3f}")
+            print(f"  α_spatial range: [{alpha_spatial.min().item():.4f}, {alpha_spatial.max().item():.4f}]")
+            print(f"  β_spatial range: [{beta_spatial.min().item():.4f}, {beta_spatial.max().item():.4f}]")
         
         # Channel coupling eigenvalues
         coupling_matrix = model.diff.channel_coupling
