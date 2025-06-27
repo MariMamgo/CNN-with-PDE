@@ -25,18 +25,17 @@ CIFAR100_SUPERCLASSES = [
 
 # --- Multi-Channel PDE Diffusion Layer for CIFAR ---
 class CIFARDiffusionLayer(nn.Module):
-    def __init__(self, size=32, channels=3, dt=0.05, dx=1.0, num_steps=3, use_implicit=True):
+    def __init__(self, size=32, channels=3, dt=0.1, dx=1.0, num_steps=3):  # Removed use_implicit parameter
         super().__init__()
         self.size = size
         self.channels = channels
         self.dt = dt
         self.dx = dx
         self.num_steps = num_steps
-        self.use_implicit = use_implicit
 
         # Simplified coefficients for stability - per channel scalars
-        self.alpha_base = nn.Parameter(torch.ones(channels) * 0.3)  # Smaller initial values
-        self.beta_base = nn.Parameter(torch.ones(channels) * 0.3)
+        self.alpha_base = nn.Parameter(torch.ones(channels) * 0.5)  # Can be larger with implicit
+        self.beta_base = nn.Parameter(torch.ones(channels) * 0.5)
 
         # Optional spatial variation (but much smaller)
         self.alpha_spatial = nn.Parameter(torch.zeros(channels, size, size) * 0.01)
@@ -47,7 +46,7 @@ class CIFARDiffusionLayer(nn.Module):
 
         # Stability parameters
         self.stability_eps = 1e-6
-        self.max_coeff = 0.25 if not use_implicit else 1.0
+        self.max_coeff = 2.0  # Much larger allowed with implicit method
 
     def get_alpha_beta_at_time(self, t, channel=None):
         """Get alpha and beta coefficient scalars at time t for specific channel"""
@@ -69,25 +68,21 @@ class CIFARDiffusionLayer(nn.Module):
     def forward(self, u):
         B, C, H, W = u.shape
         
-        # Process each diffusion step
+        # Process each diffusion step using implicit method only
         current_time = 0.0
         
         for step in range(self.num_steps):
             u_new = torch.zeros_like(u)
             
-            # Process each channel independently
+            # Process each channel independently with implicit solver
             for c in range(C):
                 alpha_t, beta_t = self.get_alpha_beta_at_time(current_time, channel=c)
                 
                 # Extract single channel
                 u_c = u[:, c, :, :]
                 
-                if self.use_implicit:
-                    # Use ADI (Alternating Direction Implicit) method
-                    u_c = self.adi_diffusion_step(u_c, alpha_t, beta_t)
-                else:
-                    # Use explicit finite differences (with stability check)
-                    u_c = self.explicit_diffusion_step(u_c, alpha_t, beta_t)
+                # Use ADI (Alternating Direction Implicit) method only
+                u_c = self.adi_diffusion_step(u_c, alpha_t, beta_t)
                 
                 u_new[:, c, :, :] = u_c
             
@@ -97,72 +92,12 @@ class CIFARDiffusionLayer(nn.Module):
 
         return u
 
-    def explicit_diffusion_step(self, u, alpha_coeff, beta_coeff):
-        """Explicit finite difference diffusion step (no conv2d!)"""
-        B, H, W = u.shape
-        
-        # Ensure stability for explicit scheme
-        alpha_coeff = torch.clamp(alpha_coeff, max=0.25)
-        beta_coeff = torch.clamp(beta_coeff, max=0.25)
-        
-        # Apply x-direction diffusion
-        u = self.diffuse_x_explicit(u, alpha_coeff)
-        
-        # Apply y-direction diffusion
-        u = self.diffuse_y_explicit(u, beta_coeff)
-        
-        return u
-    
-    def diffuse_x_explicit(self, u, coeff):
-        """Explicit finite difference in x-direction"""
-        B, H, W = u.shape
-        u_new = u.clone()
-        
-        # Interior points: central difference
-        if W > 2:
-            u_new[:, :, 1:-1] = u[:, :, 1:-1] + coeff * self.dt * (
-                u[:, :, 0:-2] - 2 * u[:, :, 1:-1] + u[:, :, 2:]
-            ) / (self.dx ** 2)
-        
-        # Neumann boundary conditions (zero gradient)
-        u_new[:, :, 0] = u[:, :, 0] + coeff * self.dt * (
-            u[:, :, 1] - u[:, :, 0]
-        ) / (self.dx ** 2)
-        
-        u_new[:, :, -1] = u[:, :, -1] + coeff * self.dt * (
-            u[:, :, -2] - u[:, :, -1]
-        ) / (self.dx ** 2)
-        
-        return u_new
-    
-    def diffuse_y_explicit(self, u, coeff):
-        """Explicit finite difference in y-direction"""
-        B, H, W = u.shape
-        u_new = u.clone()
-        
-        # Interior points: central difference
-        if H > 2:
-            u_new[:, 1:-1, :] = u[:, 1:-1, :] + coeff * self.dt * (
-                u[:, 0:-2, :] - 2 * u[:, 1:-1, :] + u[:, 2:, :]
-            ) / (self.dx ** 2)
-        
-        # Neumann boundary conditions (zero gradient)
-        u_new[:, 0, :] = u[:, 0, :] + coeff * self.dt * (
-            u[:, 1, :] - u[:, 0, :]
-        ) / (self.dx ** 2)
-        
-        u_new[:, -1, :] = u[:, -1, :] + coeff * self.dt * (
-            u[:, -2, :] - u[:, -1, :]
-        ) / (self.dx ** 2)
-        
-        return u_new
-    
     def adi_diffusion_step(self, u, alpha_coeff, beta_coeff):
         """ADI (Alternating Direction Implicit) diffusion step"""
-        # Step 1: Implicit in x-direction, explicit in y-direction
+        # Step 1: Implicit in x-direction
         u_half = self.solve_implicit_x(u, alpha_coeff, self.dt/2)
         
-        # Step 2: Implicit in y-direction, explicit in x-direction
+        # Step 2: Implicit in y-direction
         u_new = self.solve_implicit_y(u_half, beta_coeff, self.dt/2)
         
         return u_new
@@ -173,6 +108,9 @@ class CIFARDiffusionLayer(nn.Module):
         
         # Set up coefficients for implicit scheme
         r = coeff * dt / (self.dx ** 2)
+        # Convert to scalar if it's a tensor
+        if isinstance(r, torch.Tensor):
+            r = r.item()
         
         u_new = torch.zeros_like(u)
         
@@ -201,6 +139,9 @@ class CIFARDiffusionLayer(nn.Module):
         
         # Set up coefficients for implicit scheme
         r = coeff * dt / (self.dx ** 2)
+        # Convert to scalar if it's a tensor
+        if isinstance(r, torch.Tensor):
+            r = r.item()
         
         u_new = torch.zeros_like(u)
         
