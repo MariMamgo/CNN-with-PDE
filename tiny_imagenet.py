@@ -10,7 +10,7 @@ import numpy as np
 import os
 from PIL import Image
 
-# --- Simplified and More Stable PDE Diffusion Layer ---
+# --- Fixed and More Stable PDE Diffusion Layer ---
 class ImprovedDiffusionLayer(nn.Module):
     def __init__(self, size=64, channels=3, dt=0.05, num_steps=2, use_implicit=True):
         super().__init__()
@@ -18,18 +18,18 @@ class ImprovedDiffusionLayer(nn.Module):
         self.channels = channels
         self.dt = dt
         self.num_steps = num_steps
-        self.use_implicit = use_implicit  # Use implicit scheme for better stability
+        self.use_implicit = use_implicit
 
         # Simplified: single global coefficients per channel instead of matrices
-        self.alpha_base = nn.Parameter(torch.ones(channels) * 0.5)  # Much smaller initial values
-        self.beta_base = nn.Parameter(torch.ones(channels) * 0.5)
+        self.alpha_base = nn.Parameter(torch.ones(channels) * 0.1)  # Smaller initial values
+        self.beta_base = nn.Parameter(torch.ones(channels) * 0.1)
 
         # Optional: learnable spatial modulation (but simpler)
         self.spatial_modulation = nn.Parameter(torch.zeros(channels, size, size) * 0.01)
         
         # Stability parameters
         self.stability_eps = 1e-6
-        self.max_coeff = 0.25 if not use_implicit else 2.0  # Implicit allows larger coefficients
+        self.max_coeff = 0.2 if not use_implicit else 1.0
 
     def forward(self, u):
         B, C, H, W = u.shape
@@ -37,11 +37,16 @@ class ImprovedDiffusionLayer(nn.Module):
         # Apply diffusion to each channel
         for step in range(self.num_steps):
             for c in range(C):
-                # Get effective diffusion coefficient
-                alpha_eff = torch.clamp(self.alpha_base[c] + self.spatial_modulation[c].mean() * 0.1, 
-                                      min=self.stability_eps, max=self.max_coeff)
-                beta_eff = torch.clamp(self.beta_base[c] + self.spatial_modulation[c].mean() * 0.1,
-                                     min=self.stability_eps, max=self.max_coeff)
+                # Get effective diffusion coefficient (convert to scalar)
+                alpha_eff = torch.clamp(
+                    self.alpha_base[c] + self.spatial_modulation[c].mean() * 0.1, 
+                    min=self.stability_eps, max=self.max_coeff
+                ).item()  # Convert to scalar
+                
+                beta_eff = torch.clamp(
+                    self.beta_base[c] + self.spatial_modulation[c].mean() * 0.1,
+                    min=self.stability_eps, max=self.max_coeff
+                ).item()  # Convert to scalar
                 
                 u_c = u[:, c, :, :]
                 
@@ -57,13 +62,12 @@ class ImprovedDiffusionLayer(nn.Module):
         return u
 
     def explicit_diffusion_step(self, u, coeff):
-        """Proper PDE diffusion using finite differences (no conv2d)"""
+        """Proper PDE diffusion using finite differences"""
         B, H, W = u.shape
-        device = u.device
         
         # Ensure stability: CFL condition for explicit scheme
-        max_stable_coeff = 0.25  # For 2D explicit scheme
-        coeff = torch.clamp(coeff, min=self.stability_eps, max=max_stable_coeff)
+        max_stable_coeff = 0.2
+        coeff = min(max(coeff, self.stability_eps), max_stable_coeff)
         
         # Apply finite difference diffusion in x-direction
         u = self.diffuse_x_explicit(u, coeff)
@@ -78,7 +82,6 @@ class ImprovedDiffusionLayer(nn.Module):
         B, H, W = u.shape
         
         # ADI method: solve in x-direction implicitly, then y-direction implicitly
-        # This allows larger time steps while maintaining stability
         
         # Step 1: Implicit solve in x-direction
         u_half = self.solve_implicit_x(u, alpha_coeff, self.dt/2)
@@ -92,7 +95,7 @@ class ImprovedDiffusionLayer(nn.Module):
         """Solve implicit diffusion in x-direction using tridiagonal solver"""
         B, H, W = u.shape
         
-        # Coefficient for implicit scheme
+        # Coefficient for implicit scheme (now scalar)
         r = coeff * dt / (1.0 ** 2)  # dx = 1.0
         
         # Process each row independently
@@ -103,11 +106,10 @@ class ImprovedDiffusionLayer(nn.Module):
             row = u[:, h, :]
             
             # Set up tridiagonal system: (1 + 2r)u_i - r*u_{i-1} - r*u_{i+1} = u_old_i
-            # Tridiagonal matrix: [-r, 1+2r, -r]
-            
-            a = torch.full((B, W), -r, device=u.device)  # sub-diagonal
-            b = torch.full((B, W), 1 + 2*r, device=u.device)  # main diagonal  
-            c = torch.full((B, W), -r, device=u.device)  # super-diagonal
+            # Use scalar values for torch.full()
+            a = torch.full((B, W), -r, device=u.device, dtype=u.dtype)  # sub-diagonal
+            b = torch.full((B, W), 1 + 2*r, device=u.device, dtype=u.dtype)  # main diagonal  
+            c = torch.full((B, W), -r, device=u.device, dtype=u.dtype)  # super-diagonal
             
             # Boundary conditions (Neumann): modify first and last equations
             b[:, 0] = 1 + r  # No flux at left boundary
@@ -125,7 +127,7 @@ class ImprovedDiffusionLayer(nn.Module):
         """Solve implicit diffusion in y-direction using tridiagonal solver"""
         B, H, W = u.shape
         
-        # Coefficient for implicit scheme
+        # Coefficient for implicit scheme (now scalar)
         r = coeff * dt / (1.0 ** 2)  # dy = 1.0
         
         # Process each column independently
@@ -135,10 +137,10 @@ class ImprovedDiffusionLayer(nn.Module):
             # Extract column: (B, H)
             col = u[:, :, w]
             
-            # Set up tridiagonal system
-            a = torch.full((B, H), -r, device=u.device)  # sub-diagonal
-            b = torch.full((B, H), 1 + 2*r, device=u.device)  # main diagonal
-            c = torch.full((B, H), -r, device=u.device)  # super-diagonal
+            # Set up tridiagonal system using scalar values
+            a = torch.full((B, H), -r, device=u.device, dtype=u.dtype)  # sub-diagonal
+            b = torch.full((B, H), 1 + 2*r, device=u.device, dtype=u.dtype)  # main diagonal
+            c = torch.full((B, H), -r, device=u.device, dtype=u.dtype)  # super-diagonal
             
             # Boundary conditions (Neumann)
             b[:, 0] = 1 + r  # No flux at top boundary
@@ -185,23 +187,6 @@ class ImprovedDiffusionLayer(nn.Module):
             x[:, i] = d_prime[:, i] - c_prime[:, i] * x[:, i+1]
             
         return x
-
-    def simple_diffusion_step(self, u, coeff):
-        """Proper PDE diffusion using finite differences (no conv2d)"""
-        B, H, W = u.shape
-        device = u.device
-        
-        # Ensure stability: CFL condition for explicit scheme
-        max_stable_coeff = 0.25  # For 2D explicit scheme
-        coeff = torch.clamp(coeff, min=self.stability_eps, max=max_stable_coeff)
-        
-        # Apply finite difference diffusion in x-direction
-        u = self.diffuse_x_explicit(u, coeff)
-        
-        # Apply finite difference diffusion in y-direction  
-        u = self.diffuse_y_explicit(u, coeff)
-        
-        return u
     
     def diffuse_x_explicit(self, u, coeff):
         """Explicit finite difference diffusion in x-direction"""
@@ -209,8 +194,6 @@ class ImprovedDiffusionLayer(nn.Module):
         u_new = u.clone()
         
         # Central differences with Neumann boundary conditions
-        # u_new[i,j] = u[i,j] + coeff * dt * (u[i,j-1] - 2*u[i,j] + u[i,j+1])
-        
         # Interior points
         if W > 2:
             u_new[:, :, 1:-1] = u[:, :, 1:-1] + coeff * self.dt * (
@@ -218,10 +201,7 @@ class ImprovedDiffusionLayer(nn.Module):
             )
         
         # Boundary conditions (Neumann: zero gradient)
-        # Left boundary: u[i,0] = u[i,0] + coeff * dt * (u[i,1] - u[i,0])
         u_new[:, :, 0] = u[:, :, 0] + coeff * self.dt * (u[:, :, 1] - u[:, :, 0])
-        
-        # Right boundary: u[i,-1] = u[i,-1] + coeff * dt * (u[i,-2] - u[i,-1])
         u_new[:, :, -1] = u[:, :, -1] + coeff * self.dt * (u[:, :, -2] - u[:, :, -1])
         
         return u_new
@@ -232,8 +212,6 @@ class ImprovedDiffusionLayer(nn.Module):
         u_new = u.clone()
         
         # Central differences with Neumann boundary conditions
-        # u_new[i,j] = u[i,j] + coeff * dt * (u[i-1,j] - 2*u[i,j] + u[i+1,j])
-        
         # Interior points
         if H > 2:
             u_new[:, 1:-1, :] = u[:, 1:-1, :] + coeff * self.dt * (
@@ -241,10 +219,7 @@ class ImprovedDiffusionLayer(nn.Module):
             )
         
         # Boundary conditions (Neumann: zero gradient)
-        # Top boundary: u[0,j] = u[0,j] + coeff * dt * (u[1,j] - u[0,j])
         u_new[:, 0, :] = u[:, 0, :] + coeff * self.dt * (u[:, 1, :] - u[:, 0, :])
-        
-        # Bottom boundary: u[-1,j] = u[-1,j] + coeff * dt * (u[-2,j] - u[-1,j])
         u_new[:, -1, :] = u[:, -1, :] + coeff * self.dt * (u[:, -2, :] - u[:, -1, :])
         
         return u_new
@@ -257,7 +232,7 @@ class ImprovedTinyImageNetClassifier(nn.Module):
         
         self.use_pde = use_pde
         if use_pde:
-            self.diff = ImprovedDiffusionLayer(size=64, channels=3)
+            self.diff = ImprovedDiffusionLayer(size=64, channels=3, num_steps=1, use_implicit=False)  # Use explicit for speed
         
         # Much better CNN architecture inspired by ResNet
         self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
@@ -376,7 +351,7 @@ class ImprovedTinyImageNetDataset(Dataset):
             os.makedirs(class_dir, exist_ok=True)
             
             # Create more realistic synthetic images with class-specific patterns
-            for j in range(100):  # 100 images per class
+            for j in range(50):  # Reduced for faster testing
                 # Create images with class-specific color patterns
                 base_color = np.array([i % 3, (i // 3) % 3, (i // 9) % 3]) * 85
                 noise = np.random.randint(-30, 30, (64, 64, 3))
@@ -397,7 +372,7 @@ class ImprovedTinyImageNetDataset(Dataset):
         
         # Create validation annotations
         with open(os.path.join(dummy_dir, 'val', 'val_annotations.txt'), 'w') as f:
-            for i in range(2000):  # 10 per class
+            for i in range(1000):  # 5 per class for faster testing
                 class_idx = i % 200
                 class_id = f"n{class_idx:08d}"
                 
@@ -449,7 +424,7 @@ class ImprovedTinyImageNetDataset(Dataset):
                                 self.labels.append(self.class_to_idx[class_id])
     
     def __len__(self):
-        return len(self.image_paths) if self.image_paths else (20000 if self.split == 'train' else 2000)
+        return len(self.image_paths) if self.image_paths else (10000 if self.split == 'train' else 1000)
     
     def __getitem__(self, idx):
         if not self.image_paths:  # fallback
@@ -479,7 +454,7 @@ def train_improved_tinyimagenet():
     
     # Better data augmentation
     transform_train = transforms.Compose([
-        transforms.Resize(72),  # Slightly larger for random crop
+        transforms.Resize(72),
         transforms.RandomCrop(64),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
@@ -498,8 +473,8 @@ def train_improved_tinyimagenet():
     val_dataset = ImprovedTinyImageNetDataset('./data', split='val', transform=transform_val)
     
     # Create data loaders with better settings
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=2, pin_memory=True)
     
     # Model with and without PDE for comparison
     print("Training model WITH PDE diffusion...")
@@ -508,14 +483,14 @@ def train_improved_tinyimagenet():
     # Better optimizer and scheduler
     optimizer = torch.optim.AdamW(model_with_pde.parameters(), lr=0.001, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=0.01, epochs=20, steps_per_epoch=len(train_loader),
+        optimizer, max_lr=0.01, epochs=10, steps_per_epoch=len(train_loader),
         pct_start=0.1, anneal_strategy='cos'
     )
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     
     # Training loop
     best_acc = 0
-    for epoch in range(20):
+    for epoch in range(10):  # Reduced epochs for testing
         model_with_pde.train()
         total_loss = 0
         correct = 0
@@ -575,47 +550,7 @@ def train_improved_tinyimagenet():
         
         print("-" * 80)
     
-    # Train baseline model without PDE for comparison
-    print("\nTraining baseline model WITHOUT PDE...")
-    model_baseline = ImprovedTinyImageNetClassifier(num_classes=200, use_pde=False).to(device)
-    optimizer_baseline = torch.optim.AdamW(model_baseline.parameters(), lr=0.001, weight_decay=1e-4)
-    scheduler_baseline = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer_baseline, max_lr=0.01, epochs=5, steps_per_epoch=len(train_loader),
-        pct_start=0.1, anneal_strategy='cos'
-    )
-    
-    for epoch in range(5):  # Just a few epochs for comparison
-        model_baseline.train()
-        for batch_idx, (imgs, labels) in enumerate(train_loader):
-            imgs, labels = imgs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
-            
-            optimizer_baseline.zero_grad()
-            output = model_baseline(imgs)
-            loss = criterion(output, labels)
-            loss.backward()
-            optimizer_baseline.step()
-            scheduler_baseline.step()
-    
-    # Compare final performance
-    model_baseline.eval()
-    baseline_correct = 0
-    baseline_total = 0
-    
-    with torch.no_grad():
-        for imgs, labels in val_loader:
-            imgs, labels = imgs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
-            output = model_baseline(imgs)
-            pred = output.argmax(dim=1)
-            baseline_correct += pred.eq(labels).sum().item()
-            baseline_total += labels.size(0)
-    
-    baseline_acc = 100. * baseline_correct / baseline_total
-    
-    print(f"\nFinal Results:")
-    print(f"Best PDE Model Accuracy: {best_acc:.2f}%")
-    print(f"Baseline Model Accuracy: {baseline_acc:.2f}%")
-    print(f"PDE Improvement: {best_acc - baseline_acc:.2f}%")
-    
+    print(f"\nBest PDE Model Accuracy: {best_acc:.2f}%")
     return model_with_pde, val_loader
 
 
