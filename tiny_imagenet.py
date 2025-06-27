@@ -12,7 +12,7 @@ from PIL import Image
 
 # --- Fixed and More Stable PDE Diffusion Layer ---
 class ImprovedDiffusionLayer(nn.Module):
-    def __init__(self, size=64, channels=3, dt=0.05, num_steps=2, use_implicit=True):
+    def __init__(self, size=64, channels=3, dt=0.01, num_steps=1, use_implicit=False):
         super().__init__()
         self.size = size
         self.channels = channels
@@ -20,48 +20,56 @@ class ImprovedDiffusionLayer(nn.Module):
         self.num_steps = num_steps
         self.use_implicit = use_implicit
 
-        # Simplified: single global coefficients per channel instead of matrices
-        self.alpha_base = nn.Parameter(torch.ones(channels) * 0.1)  # Smaller initial values
-        self.beta_base = nn.Parameter(torch.ones(channels) * 0.1)
+        # Learnable diffusion coefficients - start small but allow learning
+        self.alpha_base = nn.Parameter(torch.ones(channels) * 0.05)
+        self.beta_base = nn.Parameter(torch.ones(channels) * 0.05)
 
-        # Optional: learnable spatial modulation (but simpler)
-        self.spatial_modulation = nn.Parameter(torch.zeros(channels, size, size) * 0.01)
+        # Simpler approach: just global scaling per channel
+        self.channel_scaling = nn.Parameter(torch.ones(channels))
         
         # Stability parameters
         self.stability_eps = 1e-6
-        self.max_coeff = 0.2 if not use_implicit else 1.0
+        self.max_coeff = 0.15  # Conservative for stability
 
     def forward(self, u):
         B, C, H, W = u.shape
         
-        # Apply diffusion to each channel
+        # Apply learnable diffusion
         for step in range(self.num_steps):
-            for c in range(C):
-                # Get effective diffusion coefficient (convert to scalar)
-                alpha_eff = torch.clamp(
-                    self.alpha_base[c] + self.spatial_modulation[c].mean() * 0.1, 
-                    min=self.stability_eps, max=self.max_coeff
-                ).item()  # Convert to scalar
-                
-                beta_eff = torch.clamp(
-                    self.beta_base[c] + self.spatial_modulation[c].mean() * 0.1,
-                    min=self.stability_eps, max=self.max_coeff
-                ).item()  # Convert to scalar
-                
-                u_c = u[:, c, :, :]
-                
-                if self.use_implicit:
-                    # Use implicit scheme for better stability
-                    u_c = self.implicit_diffusion_step(u_c, alpha_eff, beta_eff)
-                else:
-                    # Use explicit scheme (faster but less stable)
-                    u_c = self.explicit_diffusion_step(u_c, alpha_eff)
-                
-                u[:, c, :, :] = u_c
+            # Use differentiable coefficients (don't convert to scalar)
+            alpha_eff = torch.clamp(self.alpha_base, min=self.stability_eps, max=self.max_coeff)
+            
+            # Apply channel-wise scaling
+            u_scaled = u * self.channel_scaling.view(1, -1, 1, 1)
+            
+            # Simple explicit diffusion that maintains gradients
+            u_new = self.simple_diffusion_step(u_scaled, alpha_eff)
+            
+            # Residual connection to preserve original features
+            u = u + 0.1 * (u_new - u)  # Small residual update
         
         return u
 
-    def explicit_diffusion_step(self, u, coeff):
+    def simple_diffusion_step(self, u, coeff):
+        """Simplified differentiable diffusion using conv2d for efficiency"""
+        B, C, H, W = u.shape
+        
+        # Use conv2d-based diffusion for better gradient flow
+        # Laplacian kernel for diffusion
+        laplacian_kernel = torch.tensor([
+            [0, 1, 0],
+            [1, -4, 1],
+            [0, 1, 0]
+        ], dtype=u.dtype, device=u.device).view(1, 1, 3, 3)
+        
+        # Apply per-channel diffusion
+        u_diffused = torch.zeros_like(u)
+        for c in range(C):
+            # Apply Laplacian with coefficient
+            laplacian = F.conv2d(u[:, c:c+1, :, :], laplacian_kernel, padding=1)
+            u_diffused[:, c:c+1, :, :] = u[:, c:c+1, :, :] + coeff[c] * self.dt * laplacian
+        
+        return u_diffused
         """Proper PDE diffusion using finite differences"""
         B, H, W = u.shape
         
@@ -340,51 +348,110 @@ class ImprovedTinyImageNetDataset(Dataset):
         self.load_data()
     
     def create_synthetic_data(self):
-        """Create more realistic synthetic data for testing"""
+        """Create more challenging and realistic synthetic data"""
         dummy_dir = os.path.join(self.root_dir, 'tiny-imagenet-200')
         os.makedirs(dummy_dir, exist_ok=True)
         
-        # Create 200 classes with more realistic synthetic images
+        print("Creating more challenging synthetic dataset...")
+        
+        # Create 200 classes with diverse and learnable patterns
         for i in range(200):
             class_id = f"n{i:08d}"
             class_dir = os.path.join(dummy_dir, 'train', class_id, 'images')
             os.makedirs(class_dir, exist_ok=True)
             
-            # Create more realistic synthetic images with class-specific patterns
-            for j in range(50):  # Reduced for faster testing
-                # Create images with class-specific color patterns
-                base_color = np.array([i % 3, (i // 3) % 3, (i // 9) % 3]) * 85
-                noise = np.random.randint(-30, 30, (64, 64, 3))
-                img_array = np.clip(base_color.reshape(1, 1, 3) + noise, 0, 255).astype(np.uint8)
-                
-                # Add some geometric patterns
-                center = (32, 32)
-                y, x = np.ogrid[:64, :64]
-                mask = (x - center[0])**2 + (y - center[1])**2 <= (10 + i % 15)**2
-                img_array[mask] = [255 - base_color[0], 255 - base_color[1], 255 - base_color[2]]
-                
+            # Create class-specific pattern parameters
+            primary_color = i % 8  # 8 different primary colors
+            secondary_color = (i // 8) % 8
+            pattern_type = (i // 64) % 4  # 4 different pattern types
+            
+            for j in range(20):  # 20 images per class
+                img_array = self.create_pattern_image(primary_color, secondary_color, pattern_type, i, j)
                 dummy_img = Image.fromarray(img_array)
                 dummy_img.save(os.path.join(class_dir, f"{class_id}_{j}.JPEG"))
         
-        # Create val structure with more samples
+        # Create validation data
         val_dir = os.path.join(dummy_dir, 'val', 'images')
         os.makedirs(val_dir, exist_ok=True)
         
-        # Create validation annotations
         with open(os.path.join(dummy_dir, 'val', 'val_annotations.txt'), 'w') as f:
-            for i in range(1000):  # 5 per class for faster testing
+            for i in range(1000):  # 5 per class
                 class_idx = i % 200
                 class_id = f"n{class_idx:08d}"
                 
-                # Create validation image
-                base_color = np.array([class_idx % 3, (class_idx // 3) % 3, (class_idx // 9) % 3]) * 85
-                noise = np.random.randint(-30, 30, (64, 64, 3))
-                img_array = np.clip(base_color.reshape(1, 1, 3) + noise, 0, 255).astype(np.uint8)
+                # Create validation image with same pattern
+                primary_color = class_idx % 8
+                secondary_color = (class_idx // 8) % 8
+                pattern_type = (class_idx // 64) % 4
                 
+                img_array = self.create_pattern_image(primary_color, secondary_color, pattern_type, class_idx, i + 1000)
                 dummy_img = Image.fromarray(img_array)
                 dummy_img.save(os.path.join(val_dir, f"val_{i}.JPEG"))
                 
                 f.write(f"val_{i}.JPEG\t{class_id}\t0\t0\t64\t64\n")
+    
+    def create_pattern_image(self, primary_color, secondary_color, pattern_type, class_id, instance_id):
+        """Create a more complex and learnable pattern image"""
+        # Color palette
+        colors = [
+            [255, 0, 0],    # Red
+            [0, 255, 0],    # Green
+            [0, 0, 255],    # Blue
+            [255, 255, 0],  # Yellow
+            [255, 0, 255],  # Magenta
+            [0, 255, 255],  # Cyan
+            [128, 128, 128], # Gray
+            [255, 128, 0]   # Orange
+        ]
+        
+        img = np.zeros((64, 64, 3), dtype=np.uint8)
+        primary_rgb = colors[primary_color]
+        secondary_rgb = colors[secondary_color]
+        
+        # Add base background with primary color
+        img[:, :] = primary_rgb
+        
+        # Add noise for variation
+        np.random.seed(class_id * 1000 + instance_id)  # Deterministic but varied
+        noise = np.random.randint(-20, 20, (64, 64, 3))
+        img = np.clip(img.astype(int) + noise, 0, 255).astype(np.uint8)
+        
+        # Add pattern based on pattern_type
+        if pattern_type == 0:  # Circles
+            center_x, center_y = 32 + (class_id % 7 - 3) * 3, 32 + ((class_id // 7) % 7 - 3) * 3
+            radius = 8 + (class_id % 5) * 3
+            y, x = np.ogrid[:64, :64]
+            mask = (x - center_x)**2 + (y - center_y)**2 <= radius**2
+            img[mask] = secondary_rgb
+            
+        elif pattern_type == 1:  # Stripes
+            stripe_width = 4 + (class_id % 4)
+            for i in range(0, 64, stripe_width * 2):
+                img[:, i:i+stripe_width] = secondary_rgb
+                
+        elif pattern_type == 2:  # Checkerboard
+            block_size = 8 + (class_id % 3) * 4
+            for i in range(0, 64, block_size):
+                for j in range(0, 64, block_size):
+                    if (i // block_size + j // block_size) % 2 == 0:
+                        img[i:i+block_size, j:j+block_size] = secondary_rgb
+                        
+        elif pattern_type == 3:  # Diagonal stripes
+            for i in range(64):
+                for j in range(64):
+                    if (i + j) % (6 + class_id % 4) < 3:
+                        img[i, j] = secondary_rgb
+        
+        # Add small distinguishing features for fine-grained classification
+        feature_x = 8 + (class_id % 6) * 8
+        feature_y = 8 + ((class_id // 6) % 6) * 8
+        feature_size = 2 + (class_id % 3)
+        
+        # Small contrasting square
+        contrast_color = [255 - c for c in primary_rgb]
+        img[feature_y:feature_y+feature_size, feature_x:feature_x+feature_size] = contrast_color
+        
+        return img
     
     def load_data(self):
         """Load dataset paths and labels"""
