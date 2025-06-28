@@ -82,8 +82,10 @@ class EnhancedDiffusionLayer(nn.Module):
         # Optional: make coefficients depend on local image content
         if u is not None and self.learnable_operators:
             # Content-adaptive diffusion (simple version)
+            # Keep spatial dimensions fixed to (C, H, W)
             u_normalized = torch.sigmoid(u)
-            content_factor = 1.0 + 0.1 * (u_normalized.mean(dim=1, keepdim=True) - 0.5)
+            # Average over batch dimension to get (C, H, W)
+            content_factor = 1.0 + 0.1 * (u_normalized.mean(dim=0) - 0.5)  # Remove keepdim and average over batch
             alpha_t = alpha_t * content_factor
             beta_t = beta_t * content_factor
 
@@ -572,7 +574,7 @@ if __name__ == "__main__":
     print("=" * 50)
     
     # Train the model
-    model, test_loader, best_acc = train_cifar10_no_conv(epochs=20, learning_rate=0.001)
+    model, test_loader, best_acc = train_cifar10_no_conv(epochs=50, learning_rate=0.001)
     
     print(f"\nFinal Results:")
     print(f"Best Test Accuracy: {best_acc:.2f}%")
