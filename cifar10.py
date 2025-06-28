@@ -1,3 +1,4 @@
+# CIFAR-10 PDE Diffusion with proper dx/dy handling and RGB channel support - GPU OPTIMIZED
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,7 +18,7 @@ CIFAR10_CLASSES = ['airplane', 'automobile', 'bird', 'cat', 'deer',
 
 # --- Enhanced PDE Diffusion Layer for RGB Images ---
 class DiffusionLayer(nn.Module):
-    def __init__(self, size=32, channels=3, dt=0.001, dx=1.0, dy=1.0, num_steps=10):
+    def __init__(self, size=32, channels=3, dt=0.1, dx=1.0, dy=1.0, num_steps=5):
         super().__init__()
         self.size = size
         self.channels = channels
@@ -64,7 +65,7 @@ class DiffusionLayer(nn.Module):
 
     def forward(self, u):
         """
-        GPU-optimized forward pass through PDE diffusion layer
+        GPU-optimized forward pass avoiding in-place operations
         Input: u of shape (B, C, H, W) where C=3 for RGB
         """
         B, C, H, W = u.shape
@@ -83,12 +84,12 @@ class DiffusionLayer(nn.Module):
         current_time = 0.0
         
         for step in range(self.num_steps):
-            # Get coefficients for all channels at once (more efficient)
+            # Get coefficients for all channels at once
             alpha_all, beta_all = self.get_alpha_beta_at_time(current_time)  # Shape: (C, H, W)
             
             # Process all channels in parallel using vectorized operations
             # Reshape u to process all channels together: (B, C, H, W) -> (B*C, H, W)
-            u_flat = u.view(B * C, H, W)
+            u_flat = u.contiguous().view(B * C, H, W)
             alpha_flat = alpha_all.unsqueeze(0).expand(B, -1, -1, -1).contiguous().view(B * C, H, W)
             
             # Strang splitting: half step x
@@ -106,7 +107,7 @@ class DiffusionLayer(nn.Module):
             alpha_flat = alpha_all.unsqueeze(0).expand(B, -1, -1, -1).contiguous().view(B * C, H, W)
             u_flat = self.diffuse_x_vectorized_parallel(u_flat, alpha_flat, self.dt / 2, self.dx)
             
-            # Reshape back: (B*C, H, W) -> (B, C, H, W)
+            # Create new tensor instead of in-place modification
             u = u_flat.view(B, C, H, W)
 
         return u
@@ -261,7 +262,8 @@ class DiffusionLayer(nn.Module):
 class CIFAR10PDEClassifier(nn.Module):
     def __init__(self, dropout_rate=0.2, dx=1.0, dy=1.0):
         super().__init__()
-        self.diff = DiffusionLayer(size=32, channels=3, dx=dx, dy=dy)
+        # Fixed: use correct dt and num_steps
+        self.diff = DiffusionLayer(size=32, channels=3, dt=0.001, dx=dx, dy=dy, num_steps=10)
         
         # More complex network for CIFAR-10
         self.conv1 = nn.Conv2d(3, 64, 3, padding=1)
