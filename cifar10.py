@@ -321,7 +321,7 @@ def create_cifar10_data_loaders(batch_size=64):
     return train_loader, test_loader
 
 
-def train_cifar10_model(dx=1.0, dy=1.0, epochs=10):
+def train_cifar10_model(dx=1.0, dy=1.0, epochs=50):
     """Training function for CIFAR-10 with configurable spatial steps"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -511,6 +511,6 @@ if __name__ == "__main__":
     print("Starting CIFAR-10 PDE diffusion with proper dx/dy handling...")
     
     # Train with equal spacing
-    model, test_loader = train_cifar10_model(dx=1.0, dy=1.0, epochs=5)
+    model, test_loader = train_cifar10_model(dx=1.0, dy=1.0, epochs=50)
     print("\nTraining completed! Evaluating...")
     evaluate_and_visualize_cifar10(model, test_loader)
