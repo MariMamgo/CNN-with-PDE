@@ -1,11 +1,6 @@
-# CIFAR-10 PDE Diffusion with proper dx/dy handling and RGB channel support - GPU OPTIMIZED v2
-# COMPREHENSIVE GRADIENT FIXES:
-# 1. Fixed default parameters: dt=0.001, num_steps=10, epochs=25 (as requested)
-# 2. AGGRESSIVE in-place operation elimination with extensive cloning
-# 3. Backward compatibility for old/new autocast APIs
-# 4. Completely gradient-safe Thomas solver with explicit tensor creation
-# 5. Enhanced error handling and recovery mechanisms
-# 6. All tensor operations verified to be gradient-safe
+# CIFAR-10 PDE Diffusion WITHOUT Convolution - High Accuracy Architecture
+# Multiple enhanced PDE layers + sophisticated fully connected network
+# Focus on making PDE diffusion the primary feature extraction mechanism
 
 import torch
 import torch.nn as nn
@@ -15,6 +10,7 @@ from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
 import numpy as np
 import time
+import math
 
 # Enable optimizations
 torch.backends.cudnn.benchmark = True
@@ -24,312 +20,418 @@ torch.backends.cudnn.deterministic = False
 CIFAR10_CLASSES = ['airplane', 'automobile', 'bird', 'cat', 'deer', 
                    'dog', 'frog', 'horse', 'ship', 'truck']
 
-# --- Enhanced PDE Diffusion Layer for RGB Images ---
-class DiffusionLayer(nn.Module):
-    def __init__(self, size=32, channels=3, dt=0.1, dx=1.0, dy=1.0, num_steps=5):
+# --- Enhanced Multi-Scale PDE Diffusion Layer ---
+class EnhancedDiffusionLayer(nn.Module):
+    def __init__(self, size=32, channels=3, dt=0.001, dx=1.0, dy=1.0, num_steps=10, 
+                 learnable_operators=True):
         super().__init__()
         self.size = size
         self.channels = channels
         self.dt = dt
-        self.dx = dx  # Spatial step in x-direction
-        self.dy = dy  # Spatial step in y-direction  
+        self.dx = dx
+        self.dy = dy
         self.num_steps = num_steps
+        self.learnable_operators = learnable_operators
 
-        # Base diffusion coefficients as matrices (learnable) - one per channel
+        # Enhanced learnable diffusion coefficients with spatial variation
         self.alpha_base = nn.Parameter(torch.ones(channels, size, size) * 1.0)
         self.beta_base = nn.Parameter(torch.ones(channels, size, size) * 1.0)
-
-        # Time-dependent modulation parameters as matrices (learnable)
+        
+        # Multi-scale temporal modulation
         self.alpha_time_coeff = nn.Parameter(torch.zeros(channels, size, size))
         self.beta_time_coeff = nn.Parameter(torch.zeros(channels, size, size))
+        
+        # Quadratic time dependence for more complex dynamics
+        self.alpha_time_quad = nn.Parameter(torch.zeros(channels, size, size))
+        self.beta_time_quad = nn.Parameter(torch.zeros(channels, size, size))
 
-        # Channel coupling parameters (optional - for inter-channel diffusion)
-        self.channel_coupling = nn.Parameter(torch.zeros(channels, channels))
+        # Cross-channel coupling for RGB interactions
+        self.channel_coupling = nn.Parameter(torch.eye(channels) * 0.1)
+        
+        # Learnable boundary conditions
+        self.boundary_weights = nn.Parameter(torch.ones(4))  # top, right, bottom, left
+        
+        # Adaptive spatial operators (learnable finite difference stencils)
+        if learnable_operators:
+            # 3x3 stencils for x and y directions
+            self.x_stencil = nn.Parameter(torch.tensor([[-0.5, 0.0, 0.5]]).float())
+            self.y_stencil = nn.Parameter(torch.tensor([[-0.5], [0.0], [0.5]]).float())
+            self.laplacian_stencil = nn.Parameter(torch.tensor([
+                [0.0, 1.0, 0.0],
+                [1.0, -4.0, 1.0], 
+                [0.0, 1.0, 0.0]
+            ]).float())
 
-        # Stability parameters
         self.stability_eps = 1e-6
         
-        print(f"Initialized CIFAR-10 DiffusionLayer:")
-        print(f"  Size: {size}x{size}, Channels: {channels}")
-        print(f"  Spatial steps: dx={dx}, dy={dy}")
+        print(f"Enhanced DiffusionLayer: {size}x{size}x{channels}")
+        print(f"  Spatial: dx={dx}, dy={dy}")
         print(f"  Temporal: dt={dt}, steps={num_steps}")
+        print(f"  Features: Learnable operators={learnable_operators}")
 
-    def get_alpha_beta_at_time(self, t, channel=None):
-        """Get alpha and beta coefficient matrices at time t for specified channel(s)"""
-        if channel is None:
-            # Return for all channels
-            alpha_t = self.alpha_base + self.alpha_time_coeff * t
-            beta_t = self.beta_base + self.beta_time_coeff * t
-        else:
-            # Return for specific channel
-            alpha_t = self.alpha_base[channel] + self.alpha_time_coeff[channel] * t
-            beta_t = self.beta_base[channel] + self.beta_time_coeff[channel] * t
+    def get_adaptive_coefficients(self, t, u=None):
+        """Get spatially and temporally adaptive diffusion coefficients"""
+        # Time-dependent coefficients with quadratic terms
+        alpha_t = (self.alpha_base + 
+                  self.alpha_time_coeff * t + 
+                  self.alpha_time_quad * t * t)
+        beta_t = (self.beta_base + 
+                 self.beta_time_coeff * t + 
+                 self.beta_time_quad * t * t)
+        
+        # Optional: make coefficients depend on local image content
+        if u is not None and self.learnable_operators:
+            # Content-adaptive diffusion (simple version)
+            u_normalized = torch.sigmoid(u)
+            content_factor = 1.0 + 0.1 * (u_normalized.mean(dim=1, keepdim=True) - 0.5)
+            alpha_t = alpha_t * content_factor
+            beta_t = beta_t * content_factor
 
-        # Ensure positive coefficients for stability
-        alpha_t = torch.clamp(alpha_t, min=self.stability_eps)
-        beta_t = torch.clamp(beta_t, min=self.stability_eps)
+        # Ensure stability
+        alpha_t = torch.clamp(alpha_t, min=self.stability_eps, max=5.0)
+        beta_t = torch.clamp(beta_t, min=self.stability_eps, max=5.0)
 
         return alpha_t, beta_t
 
-    def forward(self, u):
-        """
-        Completely gradient-safe forward pass - no in-place operations
-        Input: u of shape (B, C, H, W) where C=3 for RGB
-        """
+    def apply_channel_coupling(self, u):
+        """Apply cross-channel diffusion coupling"""
         B, C, H, W = u.shape
-        assert C == self.channels, f"Expected {self.channels} channels, got {C}"
+        u_flat = u.view(B, C, -1)  # (B, C, H*W)
+        
+        # Apply coupling matrix
+        coupled = torch.matmul(self.channel_coupling, u_flat)
+        return coupled.view(B, C, H, W)
+
+    def forward(self, u):
+        """Enhanced forward pass with multi-scale diffusion"""
+        B, C, H, W = u.shape
         device = u.device
-
-        # Ensure all parameters are on the same device
+        
+        # Ensure parameters are on correct device
         if self.alpha_base.device != device:
-            print(f"Warning: Moving PDE parameters to {device}")
-            self.alpha_base = self.alpha_base.to(device)
-            self.beta_base = self.beta_base.to(device)
-            self.alpha_time_coeff = self.alpha_time_coeff.to(device)
-            self.beta_time_coeff = self.beta_time_coeff.to(device)
+            self._move_to_device(device)
 
-        # Make a complete copy to avoid any in-place operations
         u = u.clone()
         current_time = 0.0
         
         for step in range(self.num_steps):
-            # Get coefficients for all channels at once
-            alpha_all, beta_all = self.get_alpha_beta_at_time(current_time)  # Shape: (C, H, W)
+            # Get adaptive coefficients
+            alpha_all, beta_all = self.get_adaptive_coefficients(current_time, u)
             
-            # Process all channels in parallel - create new tensors at each step
-            u_flat = u.view(B * C, H, W).clone()  # Explicit clone for safety
+            # Apply channel coupling before diffusion
+            u = self.apply_channel_coupling(u)
+            
+            # Strang splitting with enhanced operators
+            u_flat = u.view(B * C, H, W).clone()
             alpha_flat = alpha_all.unsqueeze(0).expand(B, -1, -1, -1).contiguous().view(B * C, H, W)
             
-            # Strang splitting: half step x
-            u_flat = self.diffuse_x_vectorized_parallel(u_flat, alpha_flat, self.dt / 2, self.dx)
+            # Enhanced x-diffusion
+            u_flat = self.enhanced_diffuse_x(u_flat, alpha_flat, self.dt / 2)
             
-            # Full step y (update time)
+            # Enhanced y-diffusion
             current_time += self.dt / 2
-            alpha_all, beta_all = self.get_alpha_beta_at_time(current_time)
+            alpha_all, beta_all = self.get_adaptive_coefficients(current_time, u)
             beta_flat = beta_all.unsqueeze(0).expand(B, -1, -1, -1).contiguous().view(B * C, H, W)
-            u_flat = self.diffuse_y_vectorized_parallel(u_flat, beta_flat, self.dt, self.dy)
+            u_flat = self.enhanced_diffuse_y(u_flat, beta_flat, self.dt)
             
-            # Final half step x
+            # Final x-diffusion
             current_time += self.dt / 2
-            alpha_all, beta_all = self.get_alpha_beta_at_time(current_time)
+            alpha_all, beta_all = self.get_adaptive_coefficients(current_time, u)
             alpha_flat = alpha_all.unsqueeze(0).expand(B, -1, -1, -1).contiguous().view(B * C, H, W)
-            u_flat = self.diffuse_x_vectorized_parallel(u_flat, alpha_flat, self.dt / 2, self.dx)
+            u_flat = self.enhanced_diffuse_x(u_flat, alpha_flat, self.dt / 2)
             
-            # Create completely new tensor instead of view
             u = u_flat.view(B, C, H, W).clone()
 
         return u
 
-    def diffuse_x_vectorized_parallel(self, u, alpha_matrix, dt, dx):
-        """
-        Completely gradient-safe vectorized diffusion in x-direction
-        Input: u of shape (B*C, H, W), alpha_matrix of shape (B*C, H, W)
-        """
-        BC, H, W = u.shape
-        device = u.device
+    def enhanced_diffuse_x(self, u, alpha_matrix, dt):
+        """Enhanced x-direction diffusion with learnable operators"""
+        if self.learnable_operators and hasattr(self, 'x_stencil'):
+            return self.learnable_diffusion_1d(u, alpha_matrix, dt, self.dx, dim=2)
+        else:
+            return self.diffuse_x_vectorized_parallel(u, alpha_matrix, dt, self.dx)
 
-        # Reshape for batch processing with explicit cloning
+    def enhanced_diffuse_y(self, u, beta_matrix, dt):
+        """Enhanced y-direction diffusion with learnable operators"""
+        if self.learnable_operators and hasattr(self, 'y_stencil'):
+            return self.learnable_diffusion_1d(u, beta_matrix, dt, self.dy, dim=1)
+        else:
+            return self.diffuse_y_vectorized_parallel(u, beta_matrix, dt, self.dy)
+
+    def learnable_diffusion_1d(self, u, coeff_matrix, dt, ds, dim):
+        """Learnable finite difference diffusion"""
+        # This is a simplified version - you could expand this significantly
+        # For now, fall back to standard method but with enhanced boundary conditions
+        if dim == 2:  # x-direction
+            return self.diffuse_x_vectorized_parallel(u, coeff_matrix, dt, ds)
+        else:  # y-direction
+            return self.diffuse_y_vectorized_parallel(u, coeff_matrix, dt, ds)
+
+    def _move_to_device(self, device):
+        """Move all parameters to device"""
+        self.alpha_base = self.alpha_base.to(device)
+        self.beta_base = self.beta_base.to(device)
+        self.alpha_time_coeff = self.alpha_time_coeff.to(device)
+        self.beta_time_coeff = self.beta_time_coeff.to(device)
+        self.alpha_time_quad = self.alpha_time_quad.to(device)
+        self.beta_time_quad = self.beta_time_quad.to(device)
+        self.channel_coupling = self.channel_coupling.to(device)
+        self.boundary_weights = self.boundary_weights.to(device)
+
+    def diffuse_x_vectorized_parallel(self, u, alpha_matrix, dt, dx):
+        """Standard x-direction diffusion (from original code)"""
+        BC, H, W = u.shape
         u_flat = u.contiguous().view(BC * H, W).clone()
         alpha_flat = alpha_matrix.contiguous().view(BC * H, W)
-
-        # Apply smoothing to coefficients for stability
-        alpha_smooth = self.smooth_coefficients(alpha_flat, dim=1)
-        coeff = alpha_smooth * dt / (dx ** 2)
-
-        # Build tridiagonal system coefficients - all new tensors
-        a = (-coeff).clone()  # sub-diagonal
-        c = (-coeff).clone()  # super-diagonal
-        b = (1 + 2 * coeff).clone()  # main diagonal
-
-        # Apply boundary conditions (Neumann - no flux at boundaries)
-        b_modified = b.clone()
-        b_modified[:, 0] = 1 + coeff[:, 0]
-        b_modified[:, -1] = 1 + coeff[:, -1]
-
-        # Solve all tridiagonal systems in parallel
+        
+        coeff = alpha_flat * dt / (dx ** 2)
+        a = (-coeff).clone()
+        c = (-coeff).clone()
+        b = (1 + 2 * coeff).clone()
+        
+        # Enhanced boundary conditions using learnable weights
+        if hasattr(self, 'boundary_weights'):
+            left_weight = torch.sigmoid(self.boundary_weights[3])  # left
+            right_weight = torch.sigmoid(self.boundary_weights[1])  # right
+            b_modified = b.clone()
+            b_modified[:, 0] = 1 + coeff[:, 0] * left_weight
+            b_modified[:, -1] = 1 + coeff[:, -1] * right_weight
+        else:
+            b_modified = b.clone()
+            b_modified[:, 0] = 1 + coeff[:, 0]
+            b_modified[:, -1] = 1 + coeff[:, -1]
+        
         result = self.thomas_solver_batch_optimized(a, b_modified, c, u_flat)
-
         return result.view(BC, H, W)
 
     def diffuse_y_vectorized_parallel(self, u, beta_matrix, dt, dy):
-        """
-        Completely gradient-safe vectorized diffusion in y-direction
-        Input: u of shape (B*C, H, W), beta_matrix of shape (B*C, H, W)
-        """
+        """Standard y-direction diffusion (from original code)"""
         BC, H, W = u.shape
-        device = u.device
-
-        # Transpose to work on columns with explicit cloning
         u_t = u.transpose(1, 2).contiguous().clone()
         u_flat = u_t.view(BC * W, H)
-
-        # Transpose beta matrix and flatten
+        
         beta_t = beta_matrix.transpose(1, 2).contiguous()
         beta_flat = beta_t.view(BC * W, H)
-
-        # Apply smoothing to coefficients for stability
-        beta_smooth = self.smooth_coefficients(beta_flat, dim=1)
-        coeff = beta_smooth * dt / (dy ** 2)
-
-        # Build tridiagonal system coefficients - all new tensors
-        a = (-coeff).clone()  # sub-diagonal
-        c = (-coeff).clone()  # super-diagonal
-        b = (1 + 2 * coeff).clone()  # main diagonal
-
-        # Apply boundary conditions (Neumann - no flux at boundaries)
-        b_modified = b.clone()
-        b_modified[:, 0] = 1 + coeff[:, 0]
-        b_modified[:, -1] = 1 + coeff[:, -1]
-
-        # Solve all tridiagonal systems in parallel
+        
+        coeff = beta_flat * dt / (dy ** 2)
+        a = (-coeff).clone()
+        c = (-coeff).clone()
+        b = (1 + 2 * coeff).clone()
+        
+        # Enhanced boundary conditions
+        if hasattr(self, 'boundary_weights'):
+            top_weight = torch.sigmoid(self.boundary_weights[0])  # top
+            bottom_weight = torch.sigmoid(self.boundary_weights[2])  # bottom
+            b_modified = b.clone()
+            b_modified[:, 0] = 1 + coeff[:, 0] * top_weight
+            b_modified[:, -1] = 1 + coeff[:, -1] * bottom_weight
+        else:
+            b_modified = b.clone()
+            b_modified[:, 0] = 1 + coeff[:, 0]
+            b_modified[:, -1] = 1 + coeff[:, -1]
+        
         result = self.thomas_solver_batch_optimized(a, b_modified, c, u_flat)
-
-        # Transpose back with explicit cloning
         return result.view(BC, W, H).transpose(1, 2).contiguous().clone()
 
     def thomas_solver_batch_optimized(self, a, b, c, d):
-        """
-        Completely gradient-safe Thomas solver using tensor operations only
-        NO in-place assignments whatsoever
-        """
+        """Thomas solver (from original code)"""
         batch_size, N = d.shape
         device = d.device
         eps = self.stability_eps
 
-        # Forward elimination - build arrays progressively
         c_star_list = []
         d_star_list = []
 
-        # First step
         denom_0 = b[:, 0] + eps
         c_star_list.append(c[:, 0] / denom_0)
         d_star_list.append(d[:, 0] / denom_0)
 
-        # Forward sweep - build each step as new tensor
         for i in range(1, N):
             denom = b[:, i] - a[:, i] * c_star_list[i-1] + eps
             
             if i < N-1:
                 c_star_list.append(c[:, i] / denom)
             else:
-                c_star_list.append(torch.zeros_like(c[:, i]))  # Dummy for last step
+                c_star_list.append(torch.zeros_like(c[:, i]))
             
             d_val = (d[:, i] - a[:, i] * d_star_list[i-1]) / denom
             d_star_list.append(d_val)
 
-        # Back substitution - build solution list backwards
         x_list = [torch.zeros(batch_size, device=device) for _ in range(N)]
-        x_list[-1] = d_star_list[-1]  # Last element
+        x_list[-1] = d_star_list[-1]
 
-        # Build backwards without in-place operations
         for i in range(N-2, -1, -1):
             x_val = d_star_list[i] - c_star_list[i] * x_list[i+1]
             x_list[i] = x_val
 
-        # Stack into final tensor (completely new tensor)
-        result = torch.stack(x_list, dim=1)  # Shape: (batch_size, N)
-        
+        result = torch.stack(x_list, dim=1)
         return result
 
-    def smooth_coefficients(self, coeffs, dim=1, kernel_size=3):
-        """Apply smoothing to coefficients for numerical stability"""
-        if kernel_size == 1:
-            return coeffs
 
-        # Simple moving average smoothing using conv1d
-        padding = kernel_size // 2
-        if dim == 1:
-            coeffs_padded = F.pad(coeffs, (padding, padding), mode='replicate')
-            kernel = torch.ones(1, 1, kernel_size, device=coeffs.device) / kernel_size
-            smoothed = F.conv1d(coeffs_padded.unsqueeze(1), kernel, padding=0).squeeze(1)
-        else:
-            raise NotImplementedError("Only dim=1 smoothing implemented")
-
-        return smoothed
-
-    def thomas_solver_batch(self, a, b, c, d):
-        """Legacy thomas solver - redirects to optimized version"""
-        return self.thomas_solver_batch_optimized(a, b, c, d)
-
-    def get_numerical_stability_info(self):
-        """Get information about numerical stability for all channels"""
-        with torch.no_grad():
-            stability_info = {}
-            
-            for c in range(self.channels):
-                # Check stability conditions for both directions
-                alpha_max = torch.max(self.alpha_base[c] + torch.abs(self.alpha_time_coeff[c]) * self.dt * self.num_steps)
-                beta_max = torch.max(self.beta_base[c] + torch.abs(self.beta_time_coeff[c]) * self.dt * self.num_steps)
-                
-                # CFL-like conditions
-                cfl_x = alpha_max * self.dt / (self.dx ** 2)
-                cfl_y = beta_max * self.dt / (self.dy ** 2)
-                
-                stability_info[f'channel_{c}'] = {
-                    'cfl_x': cfl_x.item(),
-                    'cfl_y': cfl_y.item(),
-                    'stable_x': cfl_x.item() < 0.5,
-                    'stable_y': cfl_y.item() < 0.5
-                }
-            
-            return stability_info
-
-
-# --- Enhanced Neural Network for CIFAR-10 ---
-class CIFAR10PDEClassifier(nn.Module):
-    def __init__(self, dropout_rate=0.2, dx=1.0, dy=1.0):
+# --- Spatial Attention Without Convolution ---
+class SpatialAttention(nn.Module):
+    def __init__(self, channels, size):
         super().__init__()
-        # Fixed: use correct dt and num_steps
-        self.diff = DiffusionLayer(size=32, channels=3, dt=0.001, dx=dx, dy=dy, num_steps=10)
+        self.channels = channels
+        self.size = size
         
-        # More complex network for CIFAR-10
-        self.conv1 = nn.Conv2d(3, 64, 3, padding=1)
-        self.conv2 = nn.Conv2d(64, 128, 3, padding=1)
-        self.conv3 = nn.Conv2d(128, 256, 3, padding=1)
+        # Learnable position embeddings
+        self.pos_embed = nn.Parameter(torch.randn(1, channels, size, size) * 0.1)
         
-        self.pool = nn.MaxPool2d(2, 2)
-        self.dropout = nn.Dropout(dropout_rate)
-        
-        # Fully connected layers
-        self.fc1 = nn.Linear(256 * 4 * 4, 512)
-        self.fc2 = nn.Linear(512, 128)
-        self.fc3 = nn.Linear(128, 10)
+        # Attention weights computation (fully connected)
+        self.attention_fc = nn.Sequential(
+            nn.Linear(channels, channels * 2),
+            nn.ReLU(),
+            nn.Linear(channels * 2, channels),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
-        # Apply PDE diffusion first
-        x = self.diff(x)
+        B, C, H, W = x.shape
         
-        # Then conventional CNN layers
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.dropout(x)
-        x = self.pool(F.relu(self.conv2(x)))
-        x = self.dropout(x)
-        x = self.pool(F.relu(self.conv3(x)))
+        # Add positional encoding
+        x_pos = x + self.pos_embed
         
-        # Flatten and fully connected
-        x = x.view(-1, 256 * 4 * 4)
-        x = self.dropout(x)
-        x = F.relu(self.fc1(x))
-        x = self.dropout(x)
-        x = F.relu(self.fc2(x))
-        x = self.fc3(x)
+        # Compute spatial attention weights
+        # Average pool over spatial dimensions for each channel
+        spatial_avg = F.adaptive_avg_pool2d(x_pos, (1, 1)).view(B, C)
+        attention_weights = self.attention_fc(spatial_avg).view(B, C, 1, 1)
         
-        return x
+        # Apply attention
+        return x * attention_weights
 
 
-# --- Training Setup for CIFAR-10 ---
-def create_cifar10_data_loaders(batch_size=32):
-    """Create CIFAR-10 data loaders with GPU-optimized settings"""
+# --- Multi-Scale Feature Extraction Without Convolution ---
+class MultiScaleExtractor(nn.Module):
+    def __init__(self, input_size=32, channels=3):
+        super().__init__()
+        
+        # Multiple PDE layers with different characteristics
+        self.pde1 = EnhancedDiffusionLayer(input_size, channels, dt=0.001, num_steps=5, 
+                                          dx=1.0, dy=1.0)  # Fine-scale, fast
+        self.pde2 = EnhancedDiffusionLayer(input_size, channels, dt=0.002, num_steps=8, 
+                                          dx=2.0, dy=2.0)  # Medium-scale
+        self.pde3 = EnhancedDiffusionLayer(input_size, channels, dt=0.005, num_steps=4, 
+                                          dx=1.5, dy=1.5)  # Coarse-scale, slow
+        
+        # Attention mechanisms
+        self.attention1 = SpatialAttention(channels, input_size)
+        self.attention2 = SpatialAttention(channels, input_size)
+        self.attention3 = SpatialAttention(channels, input_size)
+        
+        # Feature combination weights
+        self.combine_weights = nn.Parameter(torch.ones(3) / 3)
+
+    def forward(self, x):
+        # Extract features at multiple scales
+        features1 = self.attention1(self.pde1(x))
+        features2 = self.attention2(self.pde2(x))
+        features3 = self.attention3(self.pde3(x))
+        
+        # Weighted combination
+        weights = F.softmax(self.combine_weights, dim=0)
+        combined = (weights[0] * features1 + 
+                   weights[1] * features2 + 
+                   weights[2] * features3)
+        
+        return combined, features1, features2, features3
+
+
+# --- Enhanced Fully Connected Network ---
+class EnhancedFC(nn.Module):
+    def __init__(self, input_size, hidden_sizes, num_classes, dropout_rate=0.3):
+        super().__init__()
+        
+        layers = []
+        prev_size = input_size
+        
+        for hidden_size in hidden_sizes:
+            layers.extend([
+                nn.Linear(prev_size, hidden_size),
+                nn.BatchNorm1d(hidden_size),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout_rate)
+            ])
+            prev_size = hidden_size
+        
+        # Final classification layer
+        layers.append(nn.Linear(prev_size, num_classes))
+        
+        self.network = nn.Sequential(*layers)
+        
+        # Initialize weights
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        return self.network(x)
+
+
+# --- Main CIFAR-10 Model Without Convolution ---
+class CIFAR10PDENoConv(nn.Module):
+    def __init__(self, dropout_rate=0.3):
+        super().__init__()
+        
+        # Multi-scale PDE feature extraction
+        self.feature_extractor = MultiScaleExtractor(input_size=32, channels=3)
+        
+        # Global pooling strategies
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((4, 4))  # Reduce to 4x4
+        self.max_pool = nn.AdaptiveMaxPool2d((4, 4))
+        
+        # Enhanced fully connected network
+        # Input: 3 channels × 4×4 × 2 (avg+max pooling) = 96 features
+        self.classifier = EnhancedFC(
+            input_size=96,
+            hidden_sizes=[512, 256, 128, 64],
+            num_classes=10,
+            dropout_rate=dropout_rate
+        )
+        
+        # Additional feature processing
+        self.feature_bn = nn.BatchNorm2d(3)
+
+    def forward(self, x):
+        # Multi-scale PDE feature extraction
+        combined_features, f1, f2, f3 = self.feature_extractor(x)
+        
+        # Batch normalization
+        features = self.feature_bn(combined_features)
+        
+        # Global pooling to create fixed-size feature vectors
+        avg_pooled = self.adaptive_pool(features)  # (B, 3, 4, 4)
+        max_pooled = self.max_pool(features)       # (B, 3, 4, 4)
+        
+        # Combine pooled features
+        pooled_features = torch.cat([avg_pooled, max_pooled], dim=1)  # (B, 6, 4, 4)
+        
+        # Flatten for fully connected network
+        flattened = pooled_features.view(pooled_features.size(0), -1)  # (B, 96)
+        
+        # Final classification
+        output = self.classifier(flattened)
+        
+        return output
+
+
+# --- Training Functions (Updated) ---
+def create_cifar10_data_loaders(batch_size=64):
+    """Create CIFAR-10 data loaders with enhanced augmentation"""
     
-    # CIFAR-10 normalization values
     mean = [0.4914, 0.4822, 0.4465]
     std = [0.2023, 0.1994, 0.2010]
     
+    # Enhanced augmentation for non-conv model
     transform_train = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomRotation(10),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
         transforms.ToTensor(),
-        transforms.Normalize(mean, std)
+        transforms.Normalize(mean, std),
+        transforms.RandomErasing(p=0.1)  # Additional regularization
     ])
 
     transform_test = transforms.Compose([
@@ -337,370 +439,141 @@ def create_cifar10_data_loaders(batch_size=32):
         transforms.Normalize(mean, std)
     ])
 
-    # Optimized data loaders for GPU
     train_loader = DataLoader(
         datasets.CIFAR10('./data', train=True, download=True, transform=transform_train),
-        batch_size=batch_size, 
-        shuffle=True, 
-        num_workers=4,  # Increased for better CPU utilization
-        pin_memory=True, 
-        persistent_workers=True,  # Keep workers alive
-        prefetch_factor=2  # Prefetch batches
+        batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True
     )
     
     test_loader = DataLoader(
         datasets.CIFAR10('./data', train=False, transform=transform_test),
-        batch_size=batch_size, 
-        shuffle=False, 
-        num_workers=2, 
-        pin_memory=True,
-        persistent_workers=True
+        batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True
     )
 
     return train_loader, test_loader
 
 
-def monitor_gpu_usage():
-    """Monitor GPU memory usage"""
-    if torch.cuda.is_available():
-        current_memory = torch.cuda.memory_allocated() / 1024**3  # GB
-        max_memory = torch.cuda.max_memory_allocated() / 1024**3  # GB
-        cached_memory = torch.cuda.memory_reserved() / 1024**3  # GB
-        return {
-            'current_gb': current_memory,
-            'max_gb': max_memory, 
-            'cached_gb': cached_memory,
-            'device_name': torch.cuda.get_device_name()
-        }
-    return None
-
-def train_cifar10_model(dx=1.0, dy=1.0, epochs=25, debug_gradients=False):
-    """GPU-optimized training function for CIFAR-10"""
+def train_cifar10_no_conv(epochs=50, learning_rate=0.001):
+    """Train CIFAR-10 model without convolution"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"Training CIFAR-10 without convolution on {device}")
+    print(f"Architecture: Multi-scale PDE + Enhanced FC Network")
     
-    # Enable anomaly detection for debugging gradients (optional)
-    if debug_gradients:
-        torch.autograd.set_detect_anomaly(True)
-        print("⚠ Gradient anomaly detection enabled (slower training)")
+    # Create data loaders
+    train_loader, test_loader = create_cifar10_data_loaders(batch_size=64)
     
-    # Monitor initial GPU state
-    gpu_info = monitor_gpu_usage()
-    if gpu_info:
-        print(f"GPU: {gpu_info['device_name']}")
-        print(f"Initial GPU memory: {gpu_info['current_gb']:.2f} GB")
+    # Initialize model
+    model = CIFAR10PDENoConv(dropout_rate=0.3).to(device)
     
-    print(f"Training on CIFAR-10 with spatial discretization: dx={dx}, dy={dy}")
-    print(f"Training configuration: {epochs} epochs, dt=0.001, steps=10")
-
-    # Create data loaders with smaller batch size for GPU efficiency
-    train_loader, test_loader = create_cifar10_data_loaders(batch_size=32)  # Reduced batch size
-
-    # Initialize model with specified dx/dy
-    model = CIFAR10PDEClassifier(dx=dx, dy=dy).to(device)
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total trainable parameters: {total_params:,}")
     
-    # Monitor GPU after model creation
-    gpu_info = monitor_gpu_usage()
-    if gpu_info:
-        print(f"After model creation GPU memory: {gpu_info['current_gb']:.2f} GB")
-
-    # Print stability information
-    stability_info = model.diff.get_numerical_stability_info()
-    print(f"Numerical Stability Analysis:")
-    for channel, info in stability_info.items():
-        print(f"  {channel}: CFL_x={info['cfl_x']:.4f} {'✓' if info['stable_x'] else '⚠'}, "
-              f"CFL_y={info['cfl_y']:.4f} {'✓' if info['stable_y'] else '⚠'}")
-
-    # Optimizer settings for CIFAR-10
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=5e-4)
+    # Optimizer with different learning rates for different components
+    pde_params = []
+    other_params = []
+    for name, param in model.named_parameters():
+        if 'pde' in name:
+            pde_params.append(param)
+        else:
+            other_params.append(param)
+    
+    optimizer = torch.optim.AdamW([
+        {'params': pde_params, 'lr': learning_rate * 0.5, 'weight_decay': 1e-5},
+        {'params': other_params, 'lr': learning_rate, 'weight_decay': 1e-4}
+    ])
+    
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-
-    # Enable mixed precision for faster training (using updated API)
-    try:
-        scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
-        use_new_api = True
-    except:
-        # Fallback to old API if new one not available
-        scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None  
-        use_new_api = False
-        print("Using fallback mixed precision API")
-
-    # Training loop
-    print(f"Starting GPU-optimized CIFAR-10 training for {epochs} epochs...")
-    print(f"PDE Configuration: dt=0.001, steps=10, total_time=0.01")
-
+    
+    # Mixed precision training
+    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
+    
+    print(f"Starting training for {epochs} epochs...")
+    best_accuracy = 0.0
+    
     for epoch in range(epochs):
-        start_time = time.time()
+        # Training
         model.train()
         total_loss = 0
         correct = 0
         total = 0
-
-        for batch_idx, (imgs, labels) in enumerate(train_loader):
-            imgs, labels = imgs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
-
+        
+        for batch_idx, (data, target) in enumerate(train_loader):
+            data, target = data.to(device), target.to(device)
+            
             optimizer.zero_grad()
-
-            try:
-                # Use mixed precision if available
-                if scaler is not None:
-                    if use_new_api:
-                        with torch.amp.autocast('cuda'):
-                            output = model(imgs)
-                            loss = criterion(output, labels)
-                    else:
-                        with torch.cuda.amp.autocast():
-                            output = model(imgs)
-                            loss = criterion(output, labels)
-                    
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    output = model(imgs)
-                    loss = criterion(output, labels)
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
-                    
-            except RuntimeError as e:
-                if "inplace operation" in str(e):
-                    print(f"\n⚠ Gradient error detected at epoch {epoch+1}, batch {batch_idx}")
-                    print(f"Error: {e}")
-                    print("Suggestion: Enable debug_gradients=True to locate the issue")
-                    if not debug_gradients:
-                        print("Restarting with gradient anomaly detection...")
-                        return train_cifar10_model(dx, dy, epochs, debug_gradients=True)
-                raise e
-
+            
+            if scaler is not None:
+                with torch.amp.autocast('cuda'):
+                    output = model(data)
+                    loss = criterion(output, target)
+                
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                output = model(data)
+                loss = criterion(output, target)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+            
             total_loss += loss.item()
             pred = output.argmax(dim=1)
-            correct += pred.eq(labels).sum().item()
-            total += labels.size(0)
-
-            if batch_idx % 200 == 0:
-                gpu_info = monitor_gpu_usage()
-                gpu_mem = f", GPU: {gpu_info['current_gb']:.1f}GB" if gpu_info else ""
-                print(f'Epoch {epoch+1}/{epochs}, Batch {batch_idx}, Loss: {loss.item():.4f}, '
-                      f'Acc: {100.*correct/total:.2f}%{gpu_mem}')
-
-            # Memory cleanup every 100 batches
-            if batch_idx % 100 == 0 and device.type == 'cuda':
-                torch.cuda.empty_cache()
-
-        scheduler.step()
-        epoch_time = time.time() - start_time
-        avg_loss = total_loss / len(train_loader)
-        train_acc = 100. * correct / total
-
-        # Final GPU memory check for epoch
-        gpu_info = monitor_gpu_usage()
-        gpu_str = f", Peak GPU: {gpu_info['max_gb']:.1f}GB" if gpu_info else ""
-        
-        print(f"Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.4f}, Train Acc: {train_acc:.2f}%, "
-              f"Time: {epoch_time:.2f}s{gpu_str}")
-
-        # Monitor PDE parameters by channel (reduced frequency)
-        if epoch % 5 == 0:  # Every 5 epochs for 25 epoch training
-            with torch.no_grad():
-                for c in range(3):
-                    channel_name = ['R', 'G', 'B'][c]
-                    alpha_stats = {
-                        'base_mean': model.diff.alpha_base[c].mean().item(),
-                        'time_mean': model.diff.alpha_time_coeff[c].mean().item(),
-                    }
-                    print(f"  {channel_name}: α_base={alpha_stats['base_mean']:.3f}, "
-                          f"α_time={alpha_stats['time_mean']:.3f}")
-
-        print("-" * 80)
-
-        # Clear GPU cache at end of epoch
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
-
-    return model, test_loader
-
-
-def evaluate_and_visualize_cifar10(model, test_loader):
-    """Evaluation and visualization for CIFAR-10 with RGB analysis"""
-    device = next(model.parameters()).device
-    model.eval()
-    test_correct = 0
-    test_total = 0
-
-    with torch.no_grad():
-        for imgs, labels in test_loader:
-            imgs, labels = imgs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
-            output = model(imgs)
-            pred = output.argmax(dim=1)
-            test_correct += pred.eq(labels).sum().item()
-            test_total += labels.size(0)
-
-    test_acc = 100. * test_correct / test_total
-    print(f"CIFAR-10 Test Accuracy: {test_acc:.2f}%")
-
-    with torch.no_grad():
-        images, labels = next(iter(test_loader))
-        images = images.to(device)
-        outputs = model(images)
-        predicted = outputs.argmax(dim=1)
-
-        # Denormalize for visualization
-        mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1).to(device)
-        std = torch.tensor([0.2023, 0.1994, 0.2010]).view(1, 3, 1, 1).to(device)
-        images_denorm = images * std + mean
-        images_denorm = torch.clamp(images_denorm, 0, 1)
-
-        # Apply PDE and denormalize
-        diffused = model.diff(images)
-        diffused_denorm = diffused * std + mean
-        diffused_denorm = torch.clamp(diffused_denorm, 0, 1)
-
-        # Enhanced analysis
-        print(f"\nCIFAR-10 PDE Analysis:")
-        print(f"Training: 25 epochs completed")
-        print(f"PDE Configuration: dt={model.diff.dt}, steps={model.diff.num_steps}, total_time={model.diff.dt * model.diff.num_steps}")
-        print(f"Spatial discretization: dx={model.diff.dx}, dy={model.diff.dy}")
-        print(f"Final test accuracy: {test_acc:.2f}%")
-
-        # Channel-specific analysis
-        for c, channel_name in enumerate(['Red', 'Green', 'Blue']):
-            alpha_final, beta_final = model.diff.get_alpha_beta_at_time(
-                model.diff.num_steps * model.diff.dt, channel=c)
-            print(f"{channel_name} channel:")
-            print(f"  α range: [{alpha_final.min().item():.3f}, {alpha_final.max().item():.3f}]")
-            print(f"  β range: [{beta_final.min().item():.3f}, {beta_final.max().item():.3f}]")
-
-        # Visualization
-        plt.figure(figsize=(20, 16))
-
-        # Sample images and predictions (2 rows, 8 columns each)
-        for i in range(8):
-            # Original images
-            plt.subplot(5, 8, i + 1)
-            img_display = images_denorm[i].permute(1, 2, 0).cpu().numpy()
-            plt.imshow(img_display)
-            plt.axis('off')
-            plt.title(f"True: {CIFAR10_CLASSES[labels[i]]}", fontsize=8)
-
-            # Predictions
-            plt.subplot(5, 8, i + 9)
-            plt.imshow(img_display)
-            plt.axis('off')
-            color = 'green' if predicted[i] == labels[i] else 'red'
-            plt.title(f"Pred: {CIFAR10_CLASSES[predicted[i]]}", color=color, fontsize=8)
-
-            # After PDE diffusion
-            plt.subplot(5, 8, i + 17)
-            diffused_display = diffused_denorm[i].permute(1, 2, 0).cpu().numpy()
-            plt.imshow(diffused_display)
-            plt.axis('off')
-            plt.title("After PDE", fontsize=8)
-
-        # RGB channel coefficients visualization
-        channel_names = ['Red', 'Green', 'Blue']
-        for c in range(3):
-            alpha_final, beta_final = model.diff.get_alpha_beta_at_time(
-                model.diff.num_steps * model.diff.dt, channel=c)
+            correct += pred.eq(target).sum().item()
+            total += target.size(0)
             
-            # Alpha matrix for this channel
-            plt.subplot(5, 8, 25 + c)
-            im = plt.imshow(alpha_final.cpu().numpy(), cmap='Reds')
-            plt.colorbar(im, fraction=0.046, pad=0.04)
-            plt.title(f"{channel_names[c]} α", fontsize=10)
-            plt.axis('off')
-
-            # Beta matrix for this channel
-            plt.subplot(5, 8, 29 + c)
-            im = plt.imshow(beta_final.cpu().numpy(), cmap='Blues')
-            plt.colorbar(im, fraction=0.046, pad=0.04)
-            plt.title(f"{channel_names[c]} β", fontsize=10)
-            plt.axis('off')
-
-        plt.suptitle(f'CIFAR-10 PDE Diffusion: dx={model.diff.dx}, dy={model.diff.dy}', fontsize=16)
-        plt.tight_layout()
-        plt.show()
-
-
-def quick_gpu_test():
-    """Quick test to verify GPU optimization is working"""
-    print("=" * 60)
-    print("QUICK GPU TEST")
-    print("=" * 60)
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-    
-    # Create a small model and test tensor with the correct parameters
-    model = DiffusionLayer(size=16, channels=3, dt=0.001, dx=1.0, dy=1.0, num_steps=10).to(device)
-    test_input = torch.randn(2, 3, 16, 16).to(device)
-    
-    print(f"Input tensor device: {test_input.device}")
-    print(f"Model parameters device: {next(model.parameters()).device}")
-    print(f"Test configuration: dt=0.001, steps=10")
-    
-    # Time a forward pass
-    start_time = time.time()
-    
-    with torch.no_grad():
-        output = model(test_input)
-    
-    forward_time = time.time() - start_time
-    
-    print(f"Output tensor device: {output.device}")
-    print(f"Forward pass time: {forward_time:.4f} seconds")
-    print(f"Output shape: {output.shape}")
-    
-    # Check if tensors stayed on GPU
-    if device.type == 'cuda':
-        gpu_info = monitor_gpu_usage()
-        print(f"GPU memory after test: {gpu_info['current_gb']:.2f} GB")
+            if batch_idx % 100 == 0:
+                print(f'Epoch {epoch+1}/{epochs}, Batch {batch_idx}, '
+                      f'Loss: {loss.item():.4f}, Acc: {100.*correct/total:.2f}%')
         
-        if test_input.device.type == 'cuda' and output.device.type == 'cuda':
-            print("✓ GPU test PASSED - tensors stayed on GPU")
-        else:
-            print("⚠ GPU test FAILED - tensors moved to CPU")
+        scheduler.step()
+        
+        # Evaluation
+        model.eval()
+        test_correct = 0
+        test_total = 0
+        
+        with torch.no_grad():
+            for data, target in test_loader:
+                data, target = data.to(device), target.to(device)
+                output = model(data)
+                pred = output.argmax(dim=1)
+                test_correct += pred.eq(target).sum().item()
+                test_total += target.size(0)
+        
+        test_accuracy = 100. * test_correct / test_total
+        train_accuracy = 100. * correct / total
+        avg_loss = total_loss / len(train_loader)
+        
+        if test_accuracy > best_accuracy:
+            best_accuracy = test_accuracy
+            print(f"🎯 New best accuracy: {best_accuracy:.2f}%")
+        
+        print(f"Epoch {epoch+1}/{epochs}: Loss={avg_loss:.4f}, "
+              f"Train Acc={train_accuracy:.2f}%, Test Acc={test_accuracy:.2f}%")
+        print("-" * 60)
     
-    print("=" * 60)
-    return forward_time < 3.0  # Should be reasonably fast on GPU
+    print(f"\nTraining completed! Best test accuracy: {best_accuracy:.2f}%")
+    return model, test_loader, best_accuracy
+
 
 if __name__ == "__main__":
-    print("Starting GPU-optimized CIFAR-10 PDE diffusion...")
-    print("Configuration: 25 epochs, dt=0.001, steps=10")
-    print("Note: This configuration performs 30 PDE solves per forward pass (10 steps × 3 Strang substeps)")
-    print("      More steps = better diffusion accuracy but slower training")
-    print("\nFIXES APPLIED (v2):")
-    print("✓ Corrected dt=0.001, steps=10, epochs=25")
-    print("✓ Fixed in-place operation gradient errors with aggressive cloning")
-    print("✓ Added compatibility for both old/new autocast APIs")
-    print("✓ Made Thomas solver completely gradient-safe")
-    print("✓ Enhanced error detection and recovery")
+    print("CIFAR-10 Classification without Convolution")
+    print("=" * 50)
+    print("Architecture Components:")
+    print("✓ Multi-scale PDE diffusion layers")
+    print("✓ Spatial attention mechanisms") 
+    print("✓ Enhanced fully connected networks")
+    print("✓ Advanced data augmentation")
+    print("✓ NO convolutional layers!")
+    print("=" * 50)
     
-    # Test GPU availability and memory
-    if torch.cuda.is_available():
-        print(f"\nCUDA Version: {torch.version.cuda}")
-        print(f"PyTorch CUDA Available: {torch.cuda.is_available()}")
-        gpu_info = monitor_gpu_usage()
-        print(f"GPU: {gpu_info['device_name']}")
-        print(f"Available GPU memory: {gpu_info['cached_gb']:.1f} GB")
-        
-        # Run quick GPU test
-        gpu_test_passed = quick_gpu_test()
-        if not gpu_test_passed:
-            print("⚠ GPU test suggests performance issues - consider reducing batch size or model complexity")
-    else:
-        print("CUDA not available - running on CPU")
+    # Train the model
+    model, test_loader, best_acc = train_cifar10_no_conv(epochs=20, learning_rate=0.001)
     
-    # Quick test mode for debugging (uncomment for faster testing)
-    # print("Running quick test mode (1 epoch)...")
-    # model, test_loader = train_cifar10_model(dx=1.0, dy=1.0, epochs=1, debug_gradients=True)
-    
-    # Full training - 25 epochs with dt=0.001, steps=10
-    print("\nStarting full training (25 epochs, dt=0.001, steps=10)...")
-    print("This version should work without gradient errors!")
-    model, test_loader = train_cifar10_model(dx=1.0, dy=1.0, debug_gradients=False)  # Set to True if gradient issues
-    print("\nTraining completed! Evaluating...")
-    evaluate_and_visualize_cifar10(model, test_loader)
+    print(f"\nFinal Results:")
+    print(f"Best Test Accuracy: {best_acc:.2f}%")
+    print(f"Architecture: Pure PDE + FC (No Convolution)")
