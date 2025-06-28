@@ -189,41 +189,47 @@ class DiffusionLayer(nn.Module):
 
     def thomas_solver_batch_optimized(self, a, b, c, d):
         """
-        Completely gradient-safe batch Thomas algorithm 
+        Completely gradient-safe Thomas solver using tensor operations only
+        NO in-place assignments whatsoever
         """
         batch_size, N = d.shape
         device = d.device
         eps = self.stability_eps
 
-        # Create completely new tensors to avoid any in-place issues
-        c_star = torch.zeros_like(d, device=device)
-        d_star = torch.zeros_like(d, device=device)
+        # Forward elimination - build arrays progressively
+        c_star_list = []
+        d_star_list = []
 
-        # Forward elimination - using new tensor assignments
+        # First step
         denom_0 = b[:, 0] + eps
-        c_star_new = c_star.clone()
-        d_star_new = d_star.clone()
-        
-        c_star_new[:, 0] = c[:, 0] / denom_0
-        d_star_new[:, 0] = d[:, 0] / denom_0
+        c_star_list.append(c[:, 0] / denom_0)
+        d_star_list.append(d[:, 0] / denom_0)
 
-        # Forward sweep with explicit tensor creation
+        # Forward sweep - build each step as new tensor
         for i in range(1, N):
-            denom = b[:, i] - a[:, i] * c_star_new[:, i-1] + eps
+            denom = b[:, i] - a[:, i] * c_star_list[i-1] + eps
             
             if i < N-1:
-                c_star_new[:, i] = c[:, i] / denom
+                c_star_list.append(c[:, i] / denom)
+            else:
+                c_star_list.append(torch.zeros_like(c[:, i]))  # Dummy for last step
             
-            d_star_new[:, i] = (d[:, i] - a[:, i] * d_star_new[:, i-1]) / denom
+            d_val = (d[:, i] - a[:, i] * d_star_list[i-1]) / denom
+            d_star_list.append(d_val)
 
-        # Back substitution with new tensor
-        x = torch.zeros_like(d, device=device)
-        x[:, -1] = d_star_new[:, -1]
+        # Back substitution - build solution list backwards
+        x_list = [torch.zeros(batch_size, device=device) for _ in range(N)]
+        x_list[-1] = d_star_list[-1]  # Last element
 
+        # Build backwards without in-place operations
         for i in range(N-2, -1, -1):
-            x[:, i] = d_star_new[:, i] - c_star_new[:, i] * x[:, i+1]
+            x_val = d_star_list[i] - c_star_list[i] * x_list[i+1]
+            x_list[i] = x_val
 
-        return x.clone()  # Extra safety clone
+        # Stack into final tensor (completely new tensor)
+        result = torch.stack(x_list, dim=1)  # Shape: (batch_size, N)
+        
+        return result
 
     def smooth_coefficients(self, coeffs, dim=1, kernel_size=3):
         """Apply smoothing to coefficients for numerical stability"""
