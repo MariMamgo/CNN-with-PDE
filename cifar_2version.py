@@ -1,7 +1,3 @@
-# CIFAR-10 PDE Diffusion WITHOUT Convolution - High Accuracy Architecture
-# Multiple enhanced PDE layers + sophisticated fully connected network
-# Focus on making PDE diffusion the primary feature extraction mechanism
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,10 +13,10 @@ torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
 
 # CIFAR-10 class names
-CIFAR10_CLASSES = ['airplane', 'automobile', 'bird', 'cat', 'deer', 
+CIFAR10_CLASSES = ['airplane', 'automobile', 'bird', 'cat', 'deer',
                    'dog', 'frog', 'horse', 'ship', 'truck']
 
-# --- Simplified PDE Diffusion Layer Focused on Alpha/Beta Learning ---
+# --- Simplified PDE Diffusion Layer with Half Steps Only ---
 class EnhancedDiffusionLayer(nn.Module):
     def __init__(self, size=32, channels=3, dt=0.001, dx=1.0, dy=1.0, num_steps=10):
         super().__init__()
@@ -35,19 +31,20 @@ class EnhancedDiffusionLayer(nn.Module):
         # These are the main parameters we want the model to learn
         self.alpha_base = nn.Parameter(torch.ones(channels, size, size) * 1.0)
         self.beta_base = nn.Parameter(torch.ones(channels, size, size) * 1.0)
-        
+
         # Secondary learnable parameters for temporal modulation of alpha/beta
         self.alpha_time_coeff = nn.Parameter(torch.zeros(channels, size, size) * 0.1)
         self.beta_time_coeff = nn.Parameter(torch.zeros(channels, size, size) * 0.1)
 
         # Simple cross-channel coupling (learnable)
         self.channel_mixing = nn.Parameter(torch.eye(channels) + torch.randn(channels, channels) * 0.01)
-        
+
         self.stability_eps = 1e-6
-        
-        print(f"Alpha/Beta-Focused DiffusionLayer: {size}x{size}x{channels}")
+
+        print(f"Half-Step DiffusionLayer: {size}x{size}x{channels}")
         print(f"  Spatial: dx={dx}, dy={dy}")
         print(f"  Temporal: dt={dt}, steps={num_steps}")
+        print(f"  Scheme: X(dt/2) → Y(dt/2) only")
         print(f"  Learnable parameters: α matrices ({channels}x{size}x{size}), β matrices ({channels}x{size}x{size})")
 
     def get_alpha_beta_at_time(self, t):
@@ -55,7 +52,7 @@ class EnhancedDiffusionLayer(nn.Module):
         # Time-evolving alpha and beta - the core learnable diffusion parameters
         alpha_t = self.alpha_base + self.alpha_time_coeff * t
         beta_t = self.beta_base + self.beta_time_coeff * t
-        
+
         # Ensure positive coefficients for numerical stability
         alpha_t = torch.clamp(alpha_t, min=self.stability_eps, max=10.0)
         beta_t = torch.clamp(beta_t, min=self.stability_eps, max=10.0)
@@ -66,49 +63,46 @@ class EnhancedDiffusionLayer(nn.Module):
         """Apply learnable cross-channel mixing"""
         B, C, H, W = u.shape
         u_flat = u.view(B, C, -1)  # (B, C, H*W)
-        
+
         # Apply learnable channel mixing matrix
         mixed = torch.matmul(self.channel_mixing, u_flat)
         return mixed.view(B, C, H, W)
 
     def forward(self, u):
-        """Forward pass focused on learning optimal alpha/beta"""
+        """Forward pass with simplified half-step scheme: X(dt/2) → Y(dt/2)"""
         B, C, H, W = u.shape
         device = u.device
-        
+
         # Ensure parameters are on correct device
         if self.alpha_base.device != device:
             self._move_to_device(device)
 
         u = u.clone()
         current_time = 0.0
-        
+
         for step in range(self.num_steps):
             # Get current alpha and beta matrices (the key learnable parameters)
             alpha_all, beta_all = self.get_alpha_beta_at_time(current_time)
-            
+
             # Apply channel mixing before diffusion
             u = self.apply_channel_mixing(u)
-            
-            # Standard Strang splitting diffusion
+
+            # Simplified scheme: Only half steps in each direction
             u_flat = u.view(B * C, H, W).clone()
+            
+            # X-direction diffusion (half step only)
             alpha_flat = alpha_all.unsqueeze(0).expand(B, -1, -1, -1).contiguous().view(B * C, H, W)
-            
-            # X-direction diffusion (half step)
             u_flat = self.diffuse_x_vectorized_parallel(u_flat, alpha_flat, self.dt / 2, self.dx)
-            
-            # Y-direction diffusion (full step)
+
+            # Y-direction diffusion (half step only)
             current_time += self.dt / 2
             alpha_all, beta_all = self.get_alpha_beta_at_time(current_time)
             beta_flat = beta_all.unsqueeze(0).expand(B, -1, -1, -1).contiguous().view(B * C, H, W)
-            u_flat = self.diffuse_y_vectorized_parallel(u_flat, beta_flat, self.dt, self.dy)
-            
-            # X-direction diffusion (final half step)
+            u_flat = self.diffuse_y_vectorized_parallel(u_flat, beta_flat, self.dt / 2, self.dy)
+
+            # Update time for next iteration
             current_time += self.dt / 2
-            alpha_all, beta_all = self.get_alpha_beta_at_time(current_time)
-            alpha_flat = alpha_all.unsqueeze(0).expand(B, -1, -1, -1).contiguous().view(B * C, H, W)
-            u_flat = self.diffuse_x_vectorized_parallel(u_flat, alpha_flat, self.dt / 2, self.dx)
-            
+
             u = u_flat.view(B, C, H, W).clone()
 
         return u
@@ -126,12 +120,12 @@ class EnhancedDiffusionLayer(nn.Module):
         BC, H, W = u.shape
         u_flat = u.contiguous().view(BC * H, W).clone()
         alpha_flat = alpha_matrix.contiguous().view(BC * H, W)
-        
+
         coeff = alpha_flat * dt / (dx ** 2)
         a = (-coeff).clone()
         c = (-coeff).clone()
         b = (1 + 2 * coeff).clone()
-        
+
         # Enhanced boundary conditions using learnable weights
         if hasattr(self, 'boundary_weights'):
             left_weight = torch.sigmoid(self.boundary_weights[3])  # left
@@ -143,7 +137,7 @@ class EnhancedDiffusionLayer(nn.Module):
             b_modified = b.clone()
             b_modified[:, 0] = 1 + coeff[:, 0]
             b_modified[:, -1] = 1 + coeff[:, -1]
-        
+
         result = self.thomas_solver_batch_optimized(a, b_modified, c, u_flat)
         return result.view(BC, H, W)
 
@@ -152,15 +146,15 @@ class EnhancedDiffusionLayer(nn.Module):
         BC, H, W = u.shape
         u_t = u.transpose(1, 2).contiguous().clone()
         u_flat = u_t.view(BC * W, H)
-        
+
         beta_t = beta_matrix.transpose(1, 2).contiguous()
         beta_flat = beta_t.view(BC * W, H)
-        
+
         coeff = beta_flat * dt / (dy ** 2)
         a = (-coeff).clone()
         c = (-coeff).clone()
         b = (1 + 2 * coeff).clone()
-        
+
         # Enhanced boundary conditions
         if hasattr(self, 'boundary_weights'):
             top_weight = torch.sigmoid(self.boundary_weights[0])  # top
@@ -172,7 +166,7 @@ class EnhancedDiffusionLayer(nn.Module):
             b_modified = b.clone()
             b_modified[:, 0] = 1 + coeff[:, 0]
             b_modified[:, -1] = 1 + coeff[:, -1]
-        
+
         result = self.thomas_solver_batch_optimized(a, b_modified, c, u_flat)
         return result.view(BC, W, H).transpose(1, 2).contiguous().clone()
 
@@ -191,12 +185,12 @@ class EnhancedDiffusionLayer(nn.Module):
 
         for i in range(1, N):
             denom = b[:, i] - a[:, i] * c_star_list[i-1] + eps
-            
+
             if i < N-1:
                 c_star_list.append(c[:, i] / denom)
             else:
                 c_star_list.append(torch.zeros_like(c[:, i]))
-            
+
             d_val = (d[:, i] - a[:, i] * d_star_list[i-1]) / denom
             d_star_list.append(d_val)
 
@@ -217,10 +211,10 @@ class SpatialAttention(nn.Module):
         super().__init__()
         self.channels = channels
         self.size = size
-        
+
         # Learnable position embeddings
         self.pos_embed = nn.Parameter(torch.randn(1, channels, size, size) * 0.1)
-        
+
         # Attention weights computation (fully connected)
         self.attention_fc = nn.Sequential(
             nn.Linear(channels, channels * 2),
@@ -231,47 +225,65 @@ class SpatialAttention(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
-        
+
         # Add positional encoding
         x_pos = x + self.pos_embed
-        
+
         # Compute spatial attention weights
         # Average pool over spatial dimensions for each channel
         spatial_avg = F.adaptive_avg_pool2d(x_pos, (1, 1)).view(B, C)
         attention_weights = self.attention_fc(spatial_avg).view(B, C, 1, 1)
-        
+
         # Apply attention
         return x * attention_weights
 
 
-# --- Single PDE Feature Extractor Focused on Alpha/Beta Learning ---
-class SinglePDEExtractor(nn.Module):
+# --- Multi-Scale Feature Extraction Focused on Alpha/Beta Learning ---
+class MultiScaleExtractor(nn.Module):
     def __init__(self, input_size=32, channels=3):
         super().__init__()
-        
-        # Single PDE layer with specified parameters
-        self.pde = EnhancedDiffusionLayer(input_size, channels, dt=0.001, num_steps=10, 
-                                         dx=1.0, dy=1.0)  # Single α/β learning layer
-        
-        # Simple spatial attention
-        self.attention = SpatialAttention(channels, input_size)
-        
-        print(f"Single PDE α/β learning: dt=0.001, steps=10")
+
+        # Multiple PDE layers with different characteristics - focus on learning different α/β
+        self.pde1 = EnhancedDiffusionLayer(input_size, channels, dt=0.001, num_steps=5,
+                                          dx=1.0, dy=1.0)  # Fine-scale α/β learning
+        self.pde2 = EnhancedDiffusionLayer(input_size, channels, dt=0.002, num_steps=8,
+                                          dx=2.0, dy=2.0)  # Medium-scale α/β learning
+        self.pde3 = EnhancedDiffusionLayer(input_size, channels, dt=0.005, num_steps=4,
+                                          dx=1.5, dy=1.5)  # Coarse-scale α/β learning
+
+        # Simplified attention mechanisms
+        self.attention1 = SpatialAttention(channels, input_size)
+        self.attention2 = SpatialAttention(channels, input_size)
+        self.attention3 = SpatialAttention(channels, input_size)
+
+        # Learnable combination weights for multi-scale features
+        self.combine_weights = nn.Parameter(torch.ones(3) / 3)
+
+        print(f"Multi-scale α/β learning: 3 PDE layers with half-step scheme")
 
     def forward(self, x):
-        # Single PDE layer for feature extraction
-        features = self.attention(self.pde(x))
-        return features
+        # Extract features at multiple scales using different α/β parameters
+        features1 = self.attention1(self.pde1(x))  # Learn fine-scale α/β
+        features2 = self.attention2(self.pde2(x))  # Learn medium-scale α/β
+        features3 = self.attention3(self.pde3(x))  # Learn coarse-scale α/β
+
+        # Learnable weighted combination
+        weights = F.softmax(self.combine_weights, dim=0)
+        combined = (weights[0] * features1 +
+                   weights[1] * features2 +
+                   weights[2] * features3)
+
+        return combined, features1, features2, features3
 
 
 # --- Enhanced Fully Connected Network ---
 class EnhancedFC(nn.Module):
     def __init__(self, input_size, hidden_sizes, num_classes, dropout_rate=0.3):
         super().__init__()
-        
+
         layers = []
         prev_size = input_size
-        
+
         for hidden_size in hidden_sizes:
             layers.extend([
                 nn.Linear(prev_size, hidden_size),
@@ -280,12 +292,12 @@ class EnhancedFC(nn.Module):
                 nn.Dropout(dropout_rate)
             ])
             prev_size = hidden_size
-        
+
         # Final classification layer
         layers.append(nn.Linear(prev_size, num_classes))
-        
+
         self.network = nn.Sequential(*layers)
-        
+
         # Initialize weights
         for m in self.modules():
             if isinstance(m, nn.Linear):
@@ -296,18 +308,18 @@ class EnhancedFC(nn.Module):
         return self.network(x)
 
 
-# --- Main CIFAR-10 Model with Single PDE Layer ---
+# --- Main CIFAR-10 Model Without Convolution ---
 class CIFAR10PDENoConv(nn.Module):
     def __init__(self, dropout_rate=0.3):
         super().__init__()
-        
-        # Single PDE feature extraction (dt=0.001, steps=10)
-        self.feature_extractor = SinglePDEExtractor(input_size=32, channels=3)
-        
+
+        # Multi-scale PDE feature extraction
+        self.feature_extractor = MultiScaleExtractor(input_size=32, channels=3)
+
         # Global pooling strategies
         self.adaptive_pool = nn.AdaptiveAvgPool2d((4, 4))  # Reduce to 4x4
         self.max_pool = nn.AdaptiveMaxPool2d((4, 4))
-        
+
         # Enhanced fully connected network
         # Input: 3 channels × 4×4 × 2 (avg+max pooling) = 96 features
         self.classifier = EnhancedFC(
@@ -316,40 +328,40 @@ class CIFAR10PDENoConv(nn.Module):
             num_classes=10,
             dropout_rate=dropout_rate
         )
-        
+
         # Additional feature processing
         self.feature_bn = nn.BatchNorm2d(3)
 
     def forward(self, x):
-        # Single PDE feature extraction
-        features = self.feature_extractor(x)
-        
+        # Multi-scale PDE feature extraction
+        combined_features, f1, f2, f3 = self.feature_extractor(x)
+
         # Batch normalization
-        features = self.feature_bn(features)
-        
+        features = self.feature_bn(combined_features)
+
         # Global pooling to create fixed-size feature vectors
         avg_pooled = self.adaptive_pool(features)  # (B, 3, 4, 4)
         max_pooled = self.max_pool(features)       # (B, 3, 4, 4)
-        
+
         # Combine pooled features
         pooled_features = torch.cat([avg_pooled, max_pooled], dim=1)  # (B, 6, 4, 4)
-        
+
         # Flatten for fully connected network
         flattened = pooled_features.view(pooled_features.size(0), -1)  # (B, 96)
-        
+
         # Final classification
         output = self.classifier(flattened)
-        
+
         return output
 
 
 # --- Training Functions (Updated) ---
 def create_cifar10_data_loaders(batch_size=64):
     """Create CIFAR-10 data loaders with enhanced augmentation"""
-    
+
     mean = [0.4914, 0.4822, 0.4465]
     std = [0.2023, 0.1994, 0.2010]
-    
+
     # Enhanced augmentation for non-conv model
     transform_train = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
@@ -370,7 +382,7 @@ def create_cifar10_data_loaders(batch_size=64):
         datasets.CIFAR10('./data', train=True, download=True, transform=transform_train),
         batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True
     )
-    
+
     test_loader = DataLoader(
         datasets.CIFAR10('./data', train=False, transform=transform_test),
         batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True
@@ -383,24 +395,24 @@ def train_cifar10_no_conv(epochs=20, learning_rate=0.001):
     """Train CIFAR-10 model without convolution - focused on learning α/β parameters"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training CIFAR-10 without convolution on {device}")
-    print(f"Architecture: Single PDE α/β learning + Enhanced FC Network")
-    
+    print(f"Architecture: Half-step α/β learning + Enhanced FC Network")
+
     # Create data loaders
     train_loader, test_loader = create_cifar10_data_loaders(batch_size=64)
-    
+
     # Initialize model
     model = CIFAR10PDENoConv(dropout_rate=0.3).to(device)
-    
+
     # Count parameters - focus on α/β parameters
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     alpha_beta_params = 0
     for name, param in model.named_parameters():
         if 'alpha' in name or 'beta' in name:
             alpha_beta_params += param.numel()
-    
+
     print(f"Total trainable parameters: {total_params:,}")
     print(f"α/β parameters: {alpha_beta_params:,} ({100*alpha_beta_params/total_params:.1f}% of total)")
-    
+
     # Optimizer with special focus on α/β parameters
     alpha_beta_params_list = []
     other_params = []
@@ -409,40 +421,40 @@ def train_cifar10_no_conv(epochs=20, learning_rate=0.001):
             alpha_beta_params_list.append(param)
         else:
             other_params.append(param)
-    
+
     optimizer = torch.optim.AdamW([
         {'params': alpha_beta_params_list, 'lr': learning_rate, 'weight_decay': 1e-6},  # Focus on α/β learning
         {'params': other_params, 'lr': learning_rate * 0.5, 'weight_decay': 1e-4}
     ])
-    
+
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    
+
     # Mixed precision training
     scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
-    
-    print(f"Starting α/β-focused training for {epochs} epochs...")
-    print("Single PDE layer: dt=0.001, steps=10, dx=1.0, dy=1.0")
+
+    print(f"Starting half-step α/β-focused training for {epochs} epochs...")
     print("Key learnable parameters: α (x-diffusion) and β (y-diffusion) coefficient matrices")
+    print("Diffusion scheme: X(dt/2) → Y(dt/2) per step")
     best_accuracy = 0.0
-    
+
     for epoch in range(epochs):
         # Training
         model.train()
         total_loss = 0
         correct = 0
         total = 0
-        
+
         for batch_idx, (data, target) in enumerate(train_loader):
             data, target = data.to(device), target.to(device)
-            
+
             optimizer.zero_grad()
-            
+
             if scaler is not None:
                 with torch.amp.autocast('cuda'):
                     output = model(data)
                     loss = criterion(output, target)
-                
+
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -454,23 +466,23 @@ def train_cifar10_no_conv(epochs=20, learning_rate=0.001):
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
-            
+
             total_loss += loss.item()
             pred = output.argmax(dim=1)
             correct += pred.eq(target).sum().item()
             total += target.size(0)
-            
+
             if batch_idx % 100 == 0:
                 print(f'Epoch {epoch+1}/{epochs}, Batch {batch_idx}, '
                       f'Loss: {loss.item():.4f}, Acc: {100.*correct/total:.2f}%')
-        
+
         scheduler.step()
-        
+
         # Evaluation
         model.eval()
         test_correct = 0
         test_total = 0
-        
+
         with torch.no_grad():
             for data, target in test_loader:
                 data, target = data.to(device), target.to(device)
@@ -478,53 +490,56 @@ def train_cifar10_no_conv(epochs=20, learning_rate=0.001):
                 pred = output.argmax(dim=1)
                 test_correct += pred.eq(target).sum().item()
                 test_total += target.size(0)
-        
+
         test_accuracy = 100. * test_correct / test_total
         train_accuracy = 100. * correct / total
         avg_loss = total_loss / len(train_loader)
-        
+
         if test_accuracy > best_accuracy:
             best_accuracy = test_accuracy
             print(f"🎯 New best accuracy: {best_accuracy:.2f}%")
-        
+
         print(f"Epoch {epoch+1}/{epochs}: Loss={avg_loss:.4f}, "
               f"Train Acc={train_accuracy:.2f}%, Test Acc={test_accuracy:.2f}%")
-        
+
         # Monitor α/β parameter statistics every 5 epochs
         if epoch % 5 == 0:
             with torch.no_grad():
                 print("α/β Parameter Statistics:")
-                pde_layer = model.feature_extractor.pde
-                for c in range(3):
-                    alpha_stats = pde_layer.alpha_base[c]
-                    beta_stats = pde_layer.beta_base[c]
-                    channel_name = ['R', 'G', 'B'][c]
-                    print(f"  {channel_name}: α∈[{alpha_stats.min():.3f}, {alpha_stats.max():.3f}], "
-                          f"β∈[{beta_stats.min():.3f}, {beta_stats.max():.3f}]")
-        
+                for i, pde_layer in enumerate([model.feature_extractor.pde1,
+                                             model.feature_extractor.pde2,
+                                             model.feature_extractor.pde3]):
+                    for c in range(3):
+                        alpha_stats = pde_layer.alpha_base[c]
+                        beta_stats = pde_layer.beta_base[c]
+                        channel_name = ['R', 'G', 'B'][c]
+                        print(f"  PDE{i+1}-{channel_name}: α∈[{alpha_stats.min():.3f}, {alpha_stats.max():.3f}], "
+                              f"β∈[{beta_stats.min():.3f}, {beta_stats.max():.3f}]")
+
         print("-" * 60)
-    
-    print(f"\nα/β-focused training completed! Best test accuracy: {best_accuracy:.2f}%")
+
+    print(f"\nHalf-step α/β-focused training completed! Best test accuracy: {best_accuracy:.2f}%")
     return model, test_loader, best_accuracy
 
 
 if __name__ == "__main__":
-    print("CIFAR-10 Classification without Convolution")
-    print("=" * 50)
+    print("CIFAR-10 Classification without Convolution - Half-Step Scheme")
+    print("=" * 60)
     print("Focus: Learning optimal α and β diffusion parameters")
+    print("Diffusion Scheme: X(dt/2) → Y(dt/2) per iteration")
     print("Architecture Components:")
-    print("✓ Single PDE layer (dt=0.001, steps=10)")
-    print("✓ α/β coefficient learning (3×32×32 matrices each)")
-    print("✓ Spatial attention mechanism") 
-    print("✓ Enhanced fully connected network")
+    print("✓ Multi-scale α/β coefficient learning (3 PDE layers)")
+    print("✓ Simplified half-step diffusion scheme")
+    print("✓ Spatial attention mechanisms")
+    print("✓ Enhanced fully connected networks")
     print("✓ Cross-channel mixing")
     print("✓ NO convolutional layers!")
-    print("=" * 50)
-    
-    # Train the model with single PDE layer
+    print("=" * 60)
+
+    # Train the model with focus on α/β learning
     model, test_loader, best_acc = train_cifar10_no_conv(epochs=20, learning_rate=0.001)
-    
+
     print(f"\nFinal Results (20 epochs):")
     print(f"Best Test Accuracy: {best_acc:.2f}%")
-    print(f"Architecture: Single PDE (dt=0.001, steps=10) + FC")
-    print(f"Key Achievement: Learned optimal α/β diffusion coefficients for image classification")
+    print(f"Architecture: Half-step α/β-focused PDE + FC (No Convolution)")
+    print(f"Key Achievement: Learned optimal diffusion coefficients with simplified scheme")
