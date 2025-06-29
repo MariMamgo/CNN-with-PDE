@@ -701,6 +701,68 @@ def evaluate_improved_model(model, test_loader):
     
     return test_acc
 
+# --- Dataset Download and Setup Functions ---
+def download_and_setup_dataset():
+    """Download and organize the emotion recognition dataset"""
+    print("📥 Downloading dataset...")
+    path = kagglehub.dataset_download("jonathanoheix/face-expression-recognition-dataset")
+    print(f"✅ Dataset downloaded to: {path}")
+    return path
+
+def find_data_directories(dataset_path):
+    """Find training and validation directories in the dataset"""
+    possible_train_names = ['train', 'training', 'Train', 'Training']
+    possible_val_names = ['test', 'validation', 'val', 'Test', 'Validation', 'Val']
+
+    train_dir = None
+    val_dir = None
+
+    print(f"Searching for data directories in: {dataset_path}")
+
+    # Check for direct subdirectories
+    for item in os.listdir(dataset_path):
+        item_path = os.path.join(dataset_path, item)
+        if os.path.isdir(item_path):
+            print(f"Found directory: {item}")
+            if item in possible_train_names:
+                train_dir = item_path
+                print(f"  -> Identified as training directory")
+            elif item in possible_val_names:
+                val_dir = item_path
+                print(f"  -> Identified as validation directory")
+            elif item == 'images':
+                # Check inside 'images' folder
+                images_path = item_path
+                for sub_item in os.listdir(images_path):
+                    sub_item_path = os.path.join(images_path, sub_item)
+                    if os.path.isdir(sub_item_path):
+                        if sub_item in possible_train_names:
+                            train_dir = sub_item_path
+                            print(f"  -> Found training directory in images: {sub_item_path}")
+                        elif sub_item in possible_val_names:
+                            val_dir = sub_item_path
+                            print(f"  -> Found validation directory in images: {sub_item_path}")
+
+    # If not found, look deeper
+    if train_dir is None or val_dir is None:
+        print("Searching deeper in directory structure...")
+        for root, dirs, files in os.walk(dataset_path):
+            for dir_name in dirs:
+                if dir_name in possible_train_names and train_dir is None:
+                    train_dir = os.path.join(root, dir_name)
+                    print(f"Found training directory: {train_dir}")
+                elif dir_name in possible_val_names and val_dir is None:
+                    val_dir = os.path.join(root, dir_name)
+                    print(f"Found validation directory: {val_dir}")
+
+    # If still no validation directory found, we'll use the training directory
+    # and split it internally
+    if train_dir and not val_dir:
+        print("No separate validation directory found, will split training data")
+        val_dir = train_dir
+
+    return train_dir, val_dir
+
 # --- Main execution ---
 def run_improved_emotion_recognition():
     """Run the improved emotion recognition system"""
