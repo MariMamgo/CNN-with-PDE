@@ -19,7 +19,7 @@ from collections import Counter
 
 # --- Improved PDE Diffusion Layer ---
 class ImprovedDiffusionLayer(nn.Module):
-    def __init__(self, size=48, dt=0.01, dx=1.0, dy=1.0, num_steps=5):
+    def __init__(self, size=48, dt=0.01, dx=1.0, dy=1.0, num_steps=10):
         super().__init__()
         self.size = size
         self.dt = dt
