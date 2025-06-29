@@ -1,10 +1,10 @@
 # Enhanced PDE Diffusion Neural Network for Face Expression Recognition
-# Modified with Time-Dependent Vector Alpha/Beta Coefficients
+# Improved version with better feature extraction and architecture
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
 import numpy as np
@@ -13,315 +13,306 @@ import os
 from PIL import Image
 import kagglehub
 from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.utils.class_weight import compute_class_weight
 import seaborn as sns
+from collections import Counter
 
-# --- Enhanced PDE Diffusion Layer with Time-Dependent Vector Parameters ---
-class DiffusionLayer(nn.Module):
-    def __init__(self, size=48, dt=0.01, dx=1.0, dy=1.0, num_steps=10):
+# --- Improved PDE Diffusion Layer ---
+class ImprovedDiffusionLayer(nn.Module):
+    def __init__(self, size=48, dt=0.01, dx=1.0, dy=1.0, num_steps=5):
         super().__init__()
         self.size = size
         self.dt = dt
-        self.dx = dx  # Spatial step in x-direction
-        self.dy = dy  # Spatial step in y-direction
+        self.dx = dx
+        self.dy = dy
         self.num_steps = num_steps
 
-        # Base diffusion coefficients as 1D vectors (learnable)
-        # Alpha vector for x-direction diffusion
-        self.alpha_base_x = nn.Parameter(torch.ones(size) * 2.0)
-        self.alpha_base_y = nn.Parameter(torch.ones(size) * 2.0)
+        # Learnable diffusion coefficients - made smaller and more focused
+        self.alpha = nn.Parameter(torch.ones(1) * 0.5)
+        self.beta = nn.Parameter(torch.ones(1) * 0.5)
         
-        # Beta vector for y-direction diffusion  
-        self.beta_base_x = nn.Parameter(torch.ones(size) * 2.0)
-        self.beta_base_y = nn.Parameter(torch.ones(size) * 2.0)
-
-        # Time-dependent modulation parameters as vectors (learnable)
-        self.alpha_time_coeff_x = nn.Parameter(torch.zeros(size))
-        self.alpha_time_coeff_y = nn.Parameter(torch.zeros(size))
-        self.beta_time_coeff_x = nn.Parameter(torch.zeros(size))
-        self.beta_time_coeff_y = nn.Parameter(torch.zeros(size))
-
-        # Higher-order time dependence (quadratic terms)
-        self.alpha_time_quad_x = nn.Parameter(torch.zeros(size))
-        self.alpha_time_quad_y = nn.Parameter(torch.zeros(size))
-        self.beta_time_quad_x = nn.Parameter(torch.zeros(size))
-        self.beta_time_quad_y = nn.Parameter(torch.zeros(size))
-
-        # Stability parameters
-        self.stability_eps = 1e-6
-
-        print(f"Initialized DiffusionLayer with vector coefficients:")
-        print(f"  - Size: {size}x{size}, dx={dx}, dy={dy}")
-        print(f"  - Vector parameters: 4 base + 4 linear + 4 quadratic = 12 vectors")
-        print(f"  - Total learnable parameters: {12 * size}")
-
-    def get_alpha_beta_vectors_at_time(self, t):
-        """Get alpha and beta coefficient vectors at time t"""
-        # Time-dependent vectors with quadratic terms for richer dynamics
-        alpha_x_t = (self.alpha_base_x + 
-                     self.alpha_time_coeff_x * t + 
-                     self.alpha_time_quad_x * t**2)
-        alpha_y_t = (self.alpha_base_y + 
-                     self.alpha_time_coeff_y * t + 
-                     self.alpha_time_quad_y * t**2)
+        # Learnable anisotropic factors
+        self.aniso_x = nn.Parameter(torch.ones(1))
+        self.aniso_y = nn.Parameter(torch.ones(1))
         
-        beta_x_t = (self.beta_base_x + 
-                    self.beta_time_coeff_x * t + 
-                    self.beta_time_quad_x * t**2)
-        beta_y_t = (self.beta_base_y + 
-                    self.beta_time_coeff_y * t + 
-                    self.beta_time_quad_y * t**2)
-
-        # Ensure positive coefficients for stability
-        alpha_x_t = torch.clamp(alpha_x_t, min=self.stability_eps)
-        alpha_y_t = torch.clamp(alpha_y_t, min=self.stability_eps)
-        beta_x_t = torch.clamp(beta_x_t, min=self.stability_eps)
-        beta_y_t = torch.clamp(beta_y_t, min=self.stability_eps)
-
-        return alpha_x_t, alpha_y_t, beta_x_t, beta_y_t
-
-    def expand_vector_to_matrix(self, vec_x, vec_y, direction='x'):
-        """
-        Convert vectors to coefficient matrices for diffusion
-        vec_x: coefficients varying along x-direction (size,)
-        vec_y: coefficients varying along y-direction (size,)
-        direction: 'x' or 'y' to determine how to combine the vectors
-        """
-        if direction == 'x':
-            # For x-direction diffusion: broadcast vec_x along y-axis
-            # Each row has the same x-varying coefficients
-            matrix = vec_x.unsqueeze(0).expand(self.size, -1)  # (size, size)
-        else:  # direction == 'y'
-            # For y-direction diffusion: broadcast vec_y along x-axis  
-            # Each column has the same y-varying coefficients
-            matrix = vec_y.unsqueeze(1).expand(-1, self.size)  # (size, size)
-            
-        return matrix
+        # Edge enhancement parameters
+        self.edge_strength = nn.Parameter(torch.ones(1) * 0.1)
+        
+        print(f"Initialized ImprovedDiffusionLayer with size={size}, steps={num_steps}")
 
     def forward(self, u):
-        B, _, H, W = u.shape
-        u = u.squeeze(1)
-
-        # Apply multiple diffusion steps with time-dependent vector coefficients
-        current_time = 0.0
+        B, C, H, W = u.shape
+        u = u.squeeze(1)  # Remove channel dimension
+        
+        # Store original for residual connection
+        u_orig = u.clone()
+        
         for step in range(self.num_steps):
-            # Get vector coefficients at current time
-            alpha_x_t, alpha_y_t, beta_x_t, beta_y_t = self.get_alpha_beta_vectors_at_time(current_time)
-            
-            # Strang splitting: half step x, full step y, half step x
-            # Convert vectors to matrices for x-direction diffusion
-            alpha_matrix_x = self.expand_vector_to_matrix(alpha_x_t, alpha_y_t, direction='x')
-            u = self.diffuse_x_vectorized(u, alpha_matrix_x, self.dt / 2, self.dx)
-            current_time += self.dt / 2
-
-            # Update coefficients and do y-direction diffusion
-            alpha_x_t, alpha_y_t, beta_x_t, beta_y_t = self.get_alpha_beta_vectors_at_time(current_time)
-            beta_matrix_y = self.expand_vector_to_matrix(beta_x_t, beta_y_t, direction='y')
-            u = self.diffuse_y_vectorized(u, beta_matrix_y, self.dt, self.dy)
-            current_time += self.dt / 2
-
-            # Final half step in x-direction
-            alpha_x_t, alpha_y_t, beta_x_t, beta_y_t = self.get_alpha_beta_vectors_at_time(current_time)
-            alpha_matrix_x = self.expand_vector_to_matrix(alpha_x_t, alpha_y_t, direction='x')
-            u = self.diffuse_x_vectorized(u, alpha_matrix_x, self.dt / 2, self.dx)
-
+            u = self.diffusion_step(u)
+        
+        # Residual connection with learnable mixing
+        alpha_mix = torch.sigmoid(self.edge_strength)
+        u = alpha_mix * u + (1 - alpha_mix) * u_orig
+        
         return u.unsqueeze(1)
 
-    def diffuse_x_vectorized(self, u, alpha_matrix, dt, dx):
-        """
-        Vectorized diffusion in x-direction using proper dx spacing
-        Solves: ∂u/∂t = ∇·(α∇u) in x-direction
-        """
-        B, H, W = u.shape
-        device = u.device
+    def diffusion_step(self, u):
+        # Compute gradients
+        grad_x = torch.zeros_like(u)
+        grad_y = torch.zeros_like(u)
+        
+        # Central differences for interior points
+        grad_x[:, :, 1:-1] = (u[:, :, 2:] - u[:, :, :-2]) / (2 * self.dx)
+        grad_y[:, 1:-1, :] = (u[:, 2:, :] - u[:, :-2, :]) / (2 * self.dy)
+        
+        # Boundary conditions (zero gradient)
+        grad_x[:, :, 0] = (u[:, :, 1] - u[:, :, 0]) / self.dx
+        grad_x[:, :, -1] = (u[:, :, -1] - u[:, :, -2]) / self.dx
+        grad_y[:, 0, :] = (u[:, 1, :] - u[:, 0, :]) / self.dy
+        grad_y[:, -1, :] = (u[:, -1, :] - u[:, -2, :]) / self.dy
+        
+        # Compute divergence of diffusion flux
+        flux_x = self.alpha * self.aniso_x * grad_x
+        flux_y = self.beta * self.aniso_y * grad_y
+        
+        div_flux = torch.zeros_like(u)
+        div_flux[:, :, 1:-1] += (flux_x[:, :, 2:] - flux_x[:, :, :-2]) / (2 * self.dx)
+        div_flux[:, 1:-1, :] += (flux_y[:, 2:, :] - flux_y[:, :-2, :]) / (2 * self.dy)
+        
+        # Boundary handling
+        div_flux[:, :, 0] += (flux_x[:, :, 1] - flux_x[:, :, 0]) / self.dx
+        div_flux[:, :, -1] += (flux_x[:, :, -1] - flux_x[:, :, -2]) / self.dx
+        div_flux[:, 0, :] += (flux_y[:, 1, :] - flux_y[:, 0, :]) / self.dy
+        div_flux[:, -1, :] += (flux_y[:, -1, :] - flux_y[:, -2, :]) / self.dy
+        
+        # Update
+        u_new = u + self.dt * div_flux
+        
+        return u_new
 
-        # Reshape for batch processing: (B, H, W) -> (B*H, W)
-        u_flat = u.contiguous().view(B * H, W)
+# --- Multi-Scale Feature Extractor ---
+class MultiScaleFeatureExtractor(nn.Module):
+    def __init__(self, input_size=48):
+        super().__init__()
+        self.input_size = input_size
+        
+        # Patch-based features at different scales
+        self.patch_sizes = [3, 5, 7, 9]
+        self.patch_features = nn.ModuleList([
+            self._create_patch_extractor(ps) for ps in self.patch_sizes
+        ])
+        
+        # Statistical feature extractors
+        self.spatial_stats = SpatialStatisticsExtractor(input_size)
+        self.gradient_features = GradientFeatureExtractor(input_size)
+        
+        # Learnable feature weights
+        self.feature_weights = nn.Parameter(torch.ones(len(self.patch_sizes) + 2))
+        
+    def _create_patch_extractor(self, patch_size):
+        # Create a simple patch-based feature extractor
+        stride = max(1, patch_size // 2)
+        return nn.Sequential(
+            nn.Unfold(kernel_size=patch_size, stride=stride, padding=patch_size//2),
+            nn.Linear(patch_size * patch_size, 32),
+            nn.ReLU(),
+            nn.Linear(32, 16)
+        )
+    
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x = x.view(B, H, W)  # Remove channel dimension
+        
+        features = []
+        
+        # Extract patch features at different scales
+        for i, extractor in enumerate(self.patch_features):
+            x_input = x.unsqueeze(1)  # Add channel back for unfold
+            patches = extractor[0](x_input)  # Unfold
+            patches = patches.transpose(1, 2)  # (B, num_patches, patch_dim)
+            patch_features = extractor[1:](patches)  # Apply linear layers
+            # Global average pooling over patches
+            patch_features = patch_features.mean(dim=1)  # (B, 16)
+            features.append(patch_features * self.feature_weights[i])
+        
+        # Extract statistical features
+        stats = self.spatial_stats(x)
+        features.append(stats * self.feature_weights[-2])
+        
+        # Extract gradient features
+        grad_feats = self.gradient_features(x)
+        features.append(grad_feats * self.feature_weights[-1])
+        
+        # Concatenate all features
+        return torch.cat(features, dim=1)
 
-        # Expand alpha_matrix for all batches: (H, W) -> (B*H, W)
-        alpha_expanded = alpha_matrix.unsqueeze(0).expand(B, -1, -1).contiguous().view(B * H, W)
+class SpatialStatisticsExtractor(nn.Module):
+    def __init__(self, input_size):
+        super().__init__()
+        self.input_size = input_size
+        
+    def forward(self, x):
+        B, H, W = x.shape
+        
+        # Global statistics
+        mean_val = x.mean(dim=[1, 2])
+        std_val = x.std(dim=[1, 2])
+        min_val = x.min(dim=2)[0].min(dim=1)[0]
+        max_val = x.max(dim=2)[0].max(dim=1)[0]
+        
+        # Regional statistics (divide image into quadrants)
+        h_mid, w_mid = H // 2, W // 2
+        regions = [
+            x[:, :h_mid, :w_mid],      # Top-left
+            x[:, :h_mid, w_mid:],      # Top-right
+            x[:, h_mid:, :w_mid],      # Bottom-left
+            x[:, h_mid:, w_mid:]       # Bottom-right
+        ]
+        
+        regional_means = torch.stack([r.mean(dim=[1, 2]) for r in regions], dim=1)
+        regional_stds = torch.stack([r.std(dim=[1, 2]) for r in regions], dim=1)
+        
+        # Combine features
+        features = torch.cat([
+            mean_val.unsqueeze(1), std_val.unsqueeze(1),
+            min_val.unsqueeze(1), max_val.unsqueeze(1),
+            regional_means, regional_stds
+        ], dim=1)
+        
+        return features
 
-        # Apply smoothing to coefficients for stability
-        alpha_smooth = self.smooth_coefficients(alpha_expanded, dim=1)
-        coeff = alpha_smooth * dt / (dx ** 2)  # Using dx for x-direction
+class GradientFeatureExtractor(nn.Module):
+    def __init__(self, input_size):
+        super().__init__()
+        self.input_size = input_size
+        
+    def forward(self, x):
+        B, H, W = x.shape
+        
+        # Compute gradients
+        grad_x = torch.zeros_like(x)
+        grad_y = torch.zeros_like(x)
+        
+        grad_x[:, :, 1:] = x[:, :, 1:] - x[:, :, :-1]
+        grad_y[:, 1:, :] = x[:, 1:, :] - x[:, :-1, :]
+        
+        # Gradient magnitude
+        grad_mag = torch.sqrt(grad_x**2 + grad_y**2 + 1e-8)
+        
+        # Edge statistics
+        edge_density = (grad_mag > grad_mag.mean(dim=[1, 2], keepdim=True)).float().mean(dim=[1, 2])
+        edge_strength = grad_mag.mean(dim=[1, 2])
+        edge_max = grad_mag.max(dim=2)[0].max(dim=1)[0]
+        
+        # Directional features
+        grad_angle = torch.atan2(grad_y, grad_x + 1e-8)
+        # Histogram of gradient directions (simplified)
+        angle_features = []
+        for i in range(4):  # 4 bins for angle histogram
+            angle_min = -np.pi + i * np.pi/2
+            angle_max = -np.pi + (i+1) * np.pi/2
+            mask = (grad_angle >= angle_min) & (grad_angle < angle_max)
+            angle_features.append((mask * grad_mag).sum(dim=[1, 2]) / (mask.sum(dim=[1, 2]) + 1e-8))
+        
+        angle_features = torch.stack(angle_features, dim=1)
+        
+        features = torch.cat([
+            edge_density.unsqueeze(1), edge_strength.unsqueeze(1),
+            edge_max.unsqueeze(1), angle_features
+        ], dim=1)
+        
+        return features
 
-        # Build tridiagonal system coefficients
-        a = -coeff  # sub-diagonal
-        c = -coeff  # super-diagonal
-        b = 1 + 2 * coeff  # main diagonal
-
-        # Apply boundary conditions (Neumann - no flux at boundaries)
-        b_modified = b.clone()
-        b_modified[:, 0] = 1 + coeff[:, 0]
-        b_modified[:, -1] = 1 + coeff[:, -1]
-
-        # Solve all tridiagonal systems in parallel
-        result = self.thomas_solver_batch(a, b_modified, c, u_flat)
-
-        return result.view(B, H, W)
-
-    def diffuse_y_vectorized(self, u, beta_matrix, dt, dy):
-        """
-        Vectorized diffusion in y-direction using proper dy spacing
-        Solves: ∂u/∂t = ∇·(β∇u) in y-direction
-        """
-        B, H, W = u.shape
-        device = u.device
-
-        # Transpose to work on columns: (B, H, W) -> (B, W, H)
-        u_t = u.transpose(1, 2).contiguous()
-        u_flat = u_t.view(B * W, H)
-
-        # Expand beta_matrix for all batches: (H, W) -> (B*W, H)
-        beta_expanded = beta_matrix.t().unsqueeze(0).expand(B, -1, -1).contiguous().view(B * W, H)
-
-        # Apply smoothing to coefficients for stability
-        beta_smooth = self.smooth_coefficients(beta_expanded, dim=1)
-        coeff = beta_smooth * dt / (dy ** 2)  # Using dy for y-direction
-
-        # Build tridiagonal system coefficients
-        a = -coeff  # sub-diagonal
-        c = -coeff  # super-diagonal
-        b = 1 + 2 * coeff  # main diagonal
-
-        # Apply boundary conditions (Neumann - no flux at boundaries)
-        b_modified = b.clone()
-        b_modified[:, 0] = 1 + coeff[:, 0]
-        b_modified[:, -1] = 1 + coeff[:, -1]
-
-        # Solve all tridiagonal systems in parallel
-        result = self.thomas_solver_batch(a, b_modified, c, u_flat)
-
-        # Transpose back: (B*W, H) -> (B, W, H) -> (B, H, W)
-        return result.view(B, W, H).transpose(1, 2).contiguous()
-
-    def smooth_coefficients(self, coeffs, dim=1, kernel_size=3):
-        """Apply smoothing to coefficients for numerical stability"""
-        if kernel_size == 1:
-            return coeffs
-
-        # Simple moving average smoothing using conv1d
-        padding = kernel_size // 2
-        if dim == 1:
-            coeffs_padded = F.pad(coeffs, (padding, padding), mode='replicate')
-            kernel = torch.ones(1, 1, kernel_size, device=coeffs.device) / kernel_size
-            smoothed = F.conv1d(coeffs_padded.unsqueeze(1), kernel, padding=0).squeeze(1)
-        else:
-            raise NotImplementedError("Only dim=1 smoothing implemented")
-
-        return smoothed
-
-    def thomas_solver_batch(self, a, b, c, d):
-        """
-        Batch Thomas algorithm for tridiagonal systems
-        All inputs have shape (batch_size, N)
-        """
-        batch_size, N = d.shape
-        device = d.device
-        eps = self.stability_eps
-
-        # Initialize working arrays
-        c_star = torch.zeros_like(d)
-        d_star = torch.zeros_like(d)
-
-        # Forward elimination with numerical stability
-        c_star = c_star.clone()
-        d_star = d_star.clone()
-
-        # First step
-        denom_0 = b[:, 0] + eps
-        c_star = c_star.scatter(1, torch.zeros(batch_size, 1, dtype=torch.long, device=device),
-                               (c[:, 0] / denom_0).unsqueeze(1))
-        d_star = d_star.scatter(1, torch.zeros(batch_size, 1, dtype=torch.long, device=device),
-                               (d[:, 0] / denom_0).unsqueeze(1))
-
-        # Forward sweep
-        for i in range(1, N):
-            denom = b[:, i] - a[:, i] * c_star[:, i-1] + eps
-
-            if i < N-1:
-                c_star = c_star.scatter(1, torch.full((batch_size, 1), i, dtype=torch.long, device=device),
-                                       (c[:, i] / denom).unsqueeze(1))
-
-            d_val = (d[:, i] - a[:, i] * d_star[:, i-1]) / denom
-            d_star = d_star.scatter(1, torch.full((batch_size, 1), i, dtype=torch.long, device=device),
-                                   d_val.unsqueeze(1))
-
-        # Back substitution
-        x = torch.zeros_like(d)
-        x = x.scatter(1, torch.full((batch_size, 1), N-1, dtype=torch.long, device=device),
-                     d_star[:, -1].unsqueeze(1))
-
-        # Backward sweep
-        for i in range(N-2, -1, -1):
-            x_val = d_star[:, i] - c_star[:, i] * x[:, i+1]
-            x = x.scatter(1, torch.full((batch_size, 1), i, dtype=torch.long, device=device),
-                         x_val.unsqueeze(1))
-
-        return x
-
-    def get_numerical_stability_info(self):
-        """Get information about numerical stability"""
-        with torch.no_grad():
-            # Check stability conditions for both directions across all time steps
-            max_time = self.dt * self.num_steps
+# --- Improved Classifier with Residual Connections ---
+class ImprovedFaceExpressionClassifier(nn.Module):
+    def __init__(self, dropout_rate=0.3, dx=1.0, dy=1.0):
+        super().__init__()
+        
+        # PDE diffusion layer
+        self.diffusion = ImprovedDiffusionLayer(size=48, dx=dx, dy=dy, num_steps=3)
+        
+        # Multi-scale feature extractor
+        self.feature_extractor = MultiScaleFeatureExtractor(input_size=48)
+        
+        # Calculate feature dimensions
+        # Patch features: 4 scales * 16 features = 64
+        # Spatial stats: 4 global + 8 regional = 12
+        # Gradient features: 3 edge + 4 directional = 7
+        total_features = 64 + 12 + 7
+        
+        # Enhanced classifier with residual connections
+        self.classifier = nn.Sequential(
+            nn.Linear(total_features, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
             
-            # Get maximum coefficients across time evolution
-            alpha_x_max = torch.max(self.alpha_base_x + 
-                                   torch.abs(self.alpha_time_coeff_x) * max_time +
-                                   torch.abs(self.alpha_time_quad_x) * max_time**2)
-            alpha_y_max = torch.max(self.alpha_base_y + 
-                                   torch.abs(self.alpha_time_coeff_y) * max_time +
-                                   torch.abs(self.alpha_time_quad_y) * max_time**2)
-            beta_x_max = torch.max(self.beta_base_x + 
-                                  torch.abs(self.beta_time_coeff_x) * max_time +
-                                  torch.abs(self.beta_time_quad_x) * max_time**2)
-            beta_y_max = torch.max(self.beta_base_y + 
-                                  torch.abs(self.beta_time_coeff_y) * max_time +
-                                  torch.abs(self.beta_time_quad_y) * max_time**2)
-
-            # CFL-like conditions
-            cfl_x = torch.max(alpha_x_max, beta_x_max) * self.dt / (self.dx ** 2)
-            cfl_y = torch.max(alpha_y_max, beta_y_max) * self.dt / (self.dy ** 2)
-
-            return {
-                'cfl_x': cfl_x.item(),
-                'cfl_y': cfl_y.item(),
-                'dx': self.dx,
-                'dy': self.dy,
-                'dt': self.dt,
-                'stable_x': cfl_x.item() < 0.5,
-                'stable_y': cfl_y.item() < 0.5,
-                'max_alpha_x': alpha_x_max.item(),
-                'max_alpha_y': alpha_y_max.item(),
-                'max_beta_x': beta_x_max.item(),
-                'max_beta_y': beta_y_max.item(),
-                'total_vector_params': 12 * self.size
-            }
-
-    def get_coefficient_evolution(self):
-        """Get the evolution of coefficients over time for visualization"""
-        time_points = torch.linspace(0, self.dt * self.num_steps, 50)
-        evolutions = {
-            'time': time_points.numpy(),
-            'alpha_x': [],
-            'alpha_y': [],
-            'beta_x': [],
-            'beta_y': []
-        }
+            ResidualBlock(512, 512, dropout_rate),
+            ResidualBlock(512, 256, dropout_rate),
+            ResidualBlock(256, 256, dropout_rate),
+            
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            
+            nn.Linear(128, 7)  # 7 emotion classes
+        )
         
-        with torch.no_grad():
-            for t in time_points:
-                alpha_x_t, alpha_y_t, beta_x_t, beta_y_t = self.get_alpha_beta_vectors_at_time(t)
-                evolutions['alpha_x'].append(alpha_x_t.mean().item())
-                evolutions['alpha_y'].append(alpha_y_t.mean().item())
-                evolutions['beta_x'].append(beta_x_t.mean().item())
-                evolutions['beta_y'].append(beta_y_t.mean().item())
+        # Initialize weights
+        self._initialize_weights()
         
-        return evolutions
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+        
+    def forward(self, x):
+        # Apply PDE diffusion
+        x_diffused = self.diffusion(x)
+        
+        # Extract multi-scale features
+        features = self.feature_extractor(x_diffused)
+        
+        # Classify
+        output = self.classifier(features)
+        
+        return output
 
+class ResidualBlock(nn.Module):
+    def __init__(self, in_features, out_features, dropout_rate=0.3):
+        super().__init__()
+        self.linear1 = nn.Linear(in_features, out_features)
+        self.bn1 = nn.BatchNorm1d(out_features)
+        self.linear2 = nn.Linear(out_features, out_features)
+        self.bn2 = nn.BatchNorm1d(out_features)
+        self.dropout = nn.Dropout(dropout_rate)
+        
+        # Skip connection
+        if in_features != out_features:
+            self.skip = nn.Linear(in_features, out_features)
+        else:
+            self.skip = nn.Identity()
+    
+    def forward(self, x):
+        identity = self.skip(x)
+        
+        out = F.relu(self.bn1(self.linear1(x)))
+        out = self.dropout(out)
+        out = self.bn2(self.linear2(out))
+        
+        out += identity
+        out = F.relu(out)
+        
+        return out
 
-# --- Face Expression Dataset Class (unchanged) ---
-class FaceExpressionDataset(Dataset):
+# --- Improved Dataset with Better Preprocessing ---
+class ImprovedFaceExpressionDataset(Dataset):
     def __init__(self, data_path, train=True, transform=None):
         self.transform = transform
         self.train = train
@@ -337,39 +328,35 @@ class FaceExpressionDataset(Dataset):
 
         # Load the dataset
         if os.path.isfile(data_path):
-            # If it's a single CSV file (like FER2013)
             self.data = pd.read_csv(data_path)
             self._load_from_csv()
         else:
-            # If it's a directory with image folders
             self._load_from_directory(data_path)
 
-        print(f"Loaded {'train' if train else 'test'} dataset with {len(self.image_paths) if not hasattr(self, 'data') else len(self.data)} samples")
-
-        # Print class distribution
+        print(f"Loaded {'train' if train else 'test'} dataset with {len(self.image_paths)} samples")
         self._print_class_distribution()
 
     def _load_from_csv(self):
-        """Load dataset from CSV file"""
+        """Load dataset from CSV file with better filtering"""
         if 'Usage' in self.data.columns:
-            # FER2013 format with Usage column
             if self.train:
                 self.data = self.data[self.data['Usage'] == 'Training']
             else:
                 self.data = self.data[self.data['Usage'].isin(['PublicTest', 'PrivateTest'])]
         else:
-            # Split data manually if no Usage column
-            total_len = len(self.data)
-            if self.train:
-                self.data = self.data[:int(0.8 * total_len)]
-            else:
-                self.data = self.data[int(0.8 * total_len):]
+            # Stratified split to maintain class balance
+            from sklearn.model_selection import train_test_split
+            if 'emotion' in self.data.columns:
+                train_data, test_data = train_test_split(
+                    self.data, test_size=0.2, stratify=self.data['emotion'], 
+                    random_state=42
+                )
+                self.data = train_data if self.train else test_data
 
     def _load_from_directory(self, data_path):
-        """Load dataset from directory structure"""
+        """Improved directory loading with better error handling"""
         print(f"Loading from directory: {data_path}")
-
-        # Check if emotion folders exist directly in data_path
+        
         emotion_folders = []
         for emotion in self.emotion_to_idx.keys():
             emotion_path = os.path.join(data_path, emotion)
@@ -377,77 +364,87 @@ class FaceExpressionDataset(Dataset):
                 emotion_folders.append((emotion, emotion_path))
 
         if not emotion_folders:
-            # Try alternative naming conventions
-            alternative_names = {
-                'angry': ['angry', 'anger', '0'],
-                'disgust': ['disgust', '1'],
-                'fear': ['fear', '2'],
-                'happy': ['happy', 'happiness', '3'],
-                'sad': ['sad', 'sadness', '4'],
-                'surprise': ['surprise', 'surprised', '5'],
-                'neutral': ['neutral', '6']
-            }
-
-            for emotion, alternatives in alternative_names.items():
-                for alt_name in alternatives:
-                    emotion_path = os.path.join(data_path, alt_name)
-                    if os.path.exists(emotion_path):
-                        emotion_folders.append((emotion, emotion_path))
-                        break
+            # Try numbered folders
+            for i, emotion in enumerate(self.emotion_to_idx.keys()):
+                emotion_path = os.path.join(data_path, str(i))
+                if os.path.exists(emotion_path):
+                    emotion_folders.append((emotion, emotion_path))
 
         if not emotion_folders:
-            raise ValueError(f"No emotion folders found in {data_path}. Expected folders: {list(self.emotion_to_idx.keys())}")
+            raise ValueError(f"No emotion folders found in {data_path}")
 
         print(f"Found emotion folders: {[folder[0] for folder in emotion_folders]}")
 
-        # Load images from each emotion folder
+        # Load images with validation
         for emotion, emotion_path in emotion_folders:
             emotion_idx = self.emotion_to_idx[emotion]
-
-            # Get all image files in the emotion folder
             image_files = []
+            
             for ext in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']:
-                image_files.extend([f for f in os.listdir(emotion_path) if f.lower().endswith(ext)])
+                image_files.extend([f for f in os.listdir(emotion_path) 
+                                  if f.lower().endswith(ext)])
 
-            print(f"Found {len(image_files)} images for emotion '{emotion}'")
-
+            # Validate images
+            valid_images = []
             for image_file in image_files:
+                image_path = os.path.join(emotion_path, image_file)
+                try:
+                    # Quick validation
+                    with Image.open(image_path) as img:
+                        img.verify()
+                    valid_images.append(image_file)
+                except:
+                    continue
+
+            print(f"Found {len(valid_images)} valid images for emotion '{emotion}'")
+
+            for image_file in valid_images:
                 image_path = os.path.join(emotion_path, image_file)
                 self.image_paths.append(image_path)
                 self.labels.append(emotion_idx)
 
-        # Convert to numpy arrays for easier manipulation
+        # Convert to numpy arrays and stratified split
         self.image_paths = np.array(self.image_paths)
         self.labels = np.array(self.labels)
-
-        # Shuffle the data
-        indices = np.random.permutation(len(self.image_paths))
-        self.image_paths = self.image_paths[indices]
-        self.labels = self.labels[indices]
-
-        # Split into train/test if needed (80/20 split)
-        total_len = len(self.image_paths)
-        if self.train:
-            split_idx = int(0.8 * total_len)
-            self.image_paths = self.image_paths[:split_idx]
-            self.labels = self.labels[:split_idx]
-        else:
-            split_idx = int(0.8 * total_len)
-            self.image_paths = self.image_paths[split_idx:]
-            self.labels = self.labels[split_idx:]
+        
+        from sklearn.model_selection import train_test_split
+        if len(np.unique(self.labels)) > 1:
+            train_paths, test_paths, train_labels, test_labels = train_test_split(
+                self.image_paths, self.labels, test_size=0.2, 
+                stratify=self.labels, random_state=42
+            )
+            
+            if self.train:
+                self.image_paths = train_paths
+                self.labels = train_labels
+            else:
+                self.image_paths = test_paths
+                self.labels = test_labels
 
     def _print_class_distribution(self):
-        """Print the distribution of classes in the dataset"""
+        """Print class distribution and return class weights"""
         if hasattr(self, 'data'):
-            # CSV format
             if 'emotion' in self.data.columns:
                 emotion_counts = self.data['emotion'].value_counts().sort_index()
                 print("Emotion distribution:", dict(emotion_counts))
+                return compute_class_weight('balanced', classes=np.unique(self.data['emotion']), 
+                                          y=self.data['emotion'])
         else:
-            # Directory format
             unique_labels, counts = np.unique(self.labels, return_counts=True)
-            distribution = {self.idx_to_emotion[label]: count for label, count in zip(unique_labels, counts)}
+            distribution = {self.idx_to_emotion[label]: count 
+                          for label, count in zip(unique_labels, counts)}
             print("Emotion distribution:", distribution)
+            return compute_class_weight('balanced', classes=unique_labels, y=self.labels)
+
+    def get_class_weights(self):
+        """Get class weights for handling imbalanced dataset"""
+        if hasattr(self, 'data'):
+            if 'emotion' in self.data.columns:
+                return compute_class_weight('balanced', classes=np.unique(self.data['emotion']), 
+                                          y=self.data['emotion'])
+        else:
+            unique_labels = np.unique(self.labels)
+            return compute_class_weight('balanced', classes=unique_labels, y=self.labels)
 
     def __len__(self):
         if hasattr(self, 'data'):
@@ -457,40 +454,24 @@ class FaceExpressionDataset(Dataset):
 
     def __getitem__(self, idx):
         if hasattr(self, 'data'):
-            # CSV format
             row = self.data.iloc[idx]
-
-            # Handle different data formats
             if 'pixels' in row:
-                # FER2013 format: pixels are space-separated string
                 pixels = np.array([int(p) for p in row['pixels'].split()], dtype=np.uint8)
                 image = pixels.reshape(48, 48)
-            elif 'pixel_values' in row:
-                # Alternative format
-                pixels = np.array([int(p) for p in row['pixel_values'].split()], dtype=np.uint8)
-                image = pixels.reshape(48, 48)
+                image = Image.fromarray(image, mode='L')
             else:
-                # Assume image path
                 image_path = row['image_path'] if 'image_path' in row else row[0]
                 image = Image.open(image_path).convert('L')
-                image = np.array(image)
-
-            # Convert to PIL Image for transforms
-            image = Image.fromarray(image, mode='L')
-
-            # Get label
+            
             label = row['emotion'] if 'emotion' in row else row['label']
         else:
-            # Directory format
             image_path = self.image_paths[idx]
             label = self.labels[idx]
-
-            # Load and process image
+            
             try:
                 image = Image.open(image_path).convert('L')
             except Exception as e:
                 print(f"Error loading image {image_path}: {e}")
-                # Return a black image as fallback
                 image = Image.fromarray(np.zeros((48, 48), dtype=np.uint8), mode='L')
 
         if self.transform:
@@ -498,198 +479,71 @@ class FaceExpressionDataset(Dataset):
 
         return image, label
 
+# --- Improved Training Function ---
+def train_improved_model(data_path, dx=1.0, dy=1.0, epochs=30):
+    """Improved training function with better optimization"""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-# --- Enhanced Neural Network for Face Expression Recognition ---
-class FaceExpressionPDEClassifier(nn.Module):
-    def __init__(self, dropout_rate=0.1, dx=1.0, dy=1.0):
-        super().__init__()
-        # Updated for 48x48 images and 7 emotion classes with vector coefficients
-        self.diff = DiffusionLayer(size=48, dx=dx, dy=dy)
-        self.dropout = nn.Dropout(dropout_rate)
-
-        # Adjusted network for 48x48 images
-        self.fc1 = nn.Linear(48 * 48, 512)
-        self.fc2 = nn.Linear(512, 256)
-        self.fc3 = nn.Linear(256, 7)  # 7 emotion classes
-
-        # Batch normalization for better convergence
-        self.bn1 = nn.BatchNorm1d(512)
-        self.bn2 = nn.BatchNorm1d(256)
-
-    def forward(self, x):
-        x = self.diff(x)
-        x = x.reshape(x.size(0), -1)
-
-        x = self.dropout(x)
-        x = F.relu(self.bn1(self.fc1(x)))
-        x = self.dropout(x)
-        x = F.relu(self.bn2(self.fc2(x)))
-        x = self.dropout(x)
-
-        return self.fc3(x)
-
-
-# --- Dataset Download and Setup Functions (unchanged) ---
-def download_and_setup_dataset():
-    """Download and organize the emotion recognition dataset"""
-    print("📥 Downloading dataset...")
-    path = kagglehub.dataset_download("jonathanoheix/face-expression-recognition-dataset")
-    print(f"✅ Dataset downloaded to: {path}")
-    return path
-
-def find_data_directories(dataset_path):
-    """Find training and validation directories in the dataset"""
-    possible_train_names = ['train', 'training', 'Train', 'Training']
-    possible_val_names = ['test', 'validation', 'val', 'Test', 'Validation', 'Val']
-
-    train_dir = None
-    val_dir = None
-
-    print(f"Searching for data directories in: {dataset_path}")
-
-    # Check for direct subdirectories
-    for item in os.listdir(dataset_path):
-        item_path = os.path.join(dataset_path, item)
-        if os.path.isdir(item_path):
-            print(f"Found directory: {item}")
-            if item in possible_train_names:
-                train_dir = item_path
-                print(f"  -> Identified as training directory")
-            elif item in possible_val_names:
-                val_dir = item_path
-                print(f"  -> Identified as validation directory")
-            elif item == 'images':
-                # Check inside 'images' folder
-                images_path = item_path
-                for sub_item in os.listdir(images_path):
-                    sub_item_path = os.path.join(images_path, sub_item)
-                    if os.path.isdir(sub_item_path):
-                        if sub_item in possible_train_names:
-                            train_dir = sub_item_path
-                            print(f"  -> Found training directory in images: {sub_item_path}")
-                        elif sub_item in possible_val_names:
-                            val_dir = sub_item_path
-                            print(f"  -> Found validation directory in images: {sub_item_path}")
-
-    # If not found, look deeper
-    if train_dir is None or val_dir is None:
-        print("Searching deeper in directory structure...")
-        for root, dirs, files in os.walk(dataset_path):
-            for dir_name in dirs:
-                if dir_name in possible_train_names and train_dir is None:
-                    train_dir = os.path.join(root, dir_name)
-                    print(f"Found training directory: {train_dir}")
-                elif dir_name in possible_val_names and val_dir is None:
-                    val_dir = os.path.join(root, dir_name)
-                    print(f"Found validation directory: {val_dir}")
-
-    # If still no validation directory found, we'll use the training directory
-    # and split it internally
-    if train_dir and not val_dir:
-        print("No separate validation directory found, will split training data")
-        val_dir = train_dir
-
-    return train_dir, val_dir
-
-
-# --- Data Loading Functions (unchanged) ---
-def create_face_expression_loaders(data_path, batch_size=64):
-    """Create data loaders for face expression dataset"""
-
-    # Data augmentation for training
+    # Improved data transforms
     transform_train = transforms.Compose([
         transforms.Resize((48, 48)),
-        transforms.ToTensor(),
-        transforms.RandomRotation(10),
-        transforms.RandomAffine(0, translate=(0.1, 0.1)),
+        transforms.RandomRotation(15),
+        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1)),
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.Normalize(mean=[0.5], std=[0.5])  # Normalize to [-1, 1]
+        # Add some noise for robustness
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485], std=[0.229])  # Better normalization
     ])
 
     transform_test = transforms.Compose([
         transforms.Resize((48, 48)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5], std=[0.5])
+        transforms.Normalize(mean=[0.485], std=[0.229])
     ])
 
-    try:
-        print(f"Creating datasets from path: {data_path}")
-        train_dataset = FaceExpressionDataset(data_path, train=True, transform=transform_train)
-        test_dataset = FaceExpressionDataset(data_path, train=False, transform=transform_test)
+    # Create datasets
+    train_dataset = ImprovedFaceExpressionDataset(data_path, train=True, transform=transform_train)
+    test_dataset = ImprovedFaceExpressionDataset(data_path, train=False, transform=transform_test)
 
-        # Ensure we have data
-        if len(train_dataset) == 0:
-            print("Warning: Training dataset is empty!")
-            return None, None
-        if len(test_dataset) == 0:
-            print("Warning: Test dataset is empty!")
-            return None, None
-
-        train_loader = DataLoader(
-            train_dataset, batch_size=batch_size, shuffle=True,
-            num_workers=0, pin_memory=False  # Reduced workers for compatibility
-        )
-        test_loader = DataLoader(
-            test_dataset, batch_size=batch_size, shuffle=False,
-            num_workers=0, pin_memory=False  # Reduced workers for compatibility
-        )
-
-        # Test loading a batch to ensure everything works
-        try:
-            test_batch = next(iter(train_loader))
-            print(f"Successfully loaded test batch: {test_batch[0].shape}, {test_batch[1].shape}")
-        except Exception as e:
-            print(f"Error loading test batch: {e}")
-            return None, None
-
-        return train_loader, test_loader
-
-    except Exception as e:
-        print(f"Error loading dataset: {e}")
-        import traceback
-        traceback.print_exc()
-        return None, None
-
-
-# --- Training Function ---
-def train_face_expression_model(data_path, dx=1.0, dy=1.0, epochs=25):
-    """Training function for face expression recognition with vector coefficients"""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    print(f"Spatial discretization: dx={dx}, dy={dy}")
+    # Handle class imbalance with weighted sampling
+    class_weights = train_dataset.get_class_weights()
+    sample_weights = [class_weights[label] for label in train_dataset.labels]
+    sampler = WeightedRandomSampler(sample_weights, len(sample_weights))
 
     # Create data loaders
-    train_loader, test_loader = create_face_expression_loaders(data_path, batch_size=64)
-
-    if train_loader is None:
-        print("Failed to create data loaders")
-        return None, None
+    train_loader = DataLoader(train_dataset, batch_size=32, sampler=sampler, 
+                            num_workers=0, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, 
+                           num_workers=0, pin_memory=True)
 
     # Initialize model
-    model = FaceExpressionPDEClassifier(dx=dx, dy=dy).to(device)
+    model = ImprovedFaceExpressionClassifier(dx=dx, dy=dy, dropout_rate=0.4).to(device)
+    
+    # Use weighted loss for class imbalance
+    class_weights_tensor = torch.FloatTensor(class_weights).to(device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights_tensor, label_smoothing=0.1)
 
-    # Print stability information
-    stability_info = model.diff.get_numerical_stability_info()
-    print(f"Numerical Stability Analysis (Vector Coefficients):")
-    print(f"  CFL condition X: {stability_info['cfl_x']:.4f} {'✓' if stability_info['stable_x'] else '⚠'}")
-    print(f"  CFL condition Y: {stability_info['cfl_y']:.4f} {'✓' if stability_info['stable_y'] else '⚠'}")
-    print(f"  Total vector parameters: {stability_info['total_vector_params']}")
-    print(f"  Max coefficients - αx: {stability_info['max_alpha_x']:.3f}, αy: {stability_info['max_alpha_y']:.3f}")
-    print(f"                   - βx: {stability_info['max_beta_x']:.3f}, βy: {stability_info['max_beta_y']:.3f}")
+    # Improved optimizer with different learning rates for different parts
+    optimizer = torch.optim.AdamW([
+        {'params': model.diffusion.parameters(), 'lr': 0.001},
+        {'params': model.feature_extractor.parameters(), 'lr': 0.002},
+        {'params': model.classifier.parameters(), 'lr': 0.001}
+    ], weight_decay=1e-4)
 
-    # Optimizer and loss function
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    # Better learning rate scheduling
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=10, T_mult=2, eta_min=1e-6
+    )
 
-    # Use class weights for imbalanced dataset (common in emotion recognition)
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    # Training loop with early stopping
+    best_acc = 0
+    patience = 8
+    patience_counter = 0
 
-    # Training loop
-    print("Starting training for face expression recognition with vector coefficients...")
-    import time
-
+    print("Starting improved training...")
+    
     for epoch in range(epochs):
-        start_time = time.time()
         model.train()
         total_loss = 0
         correct = 0
@@ -711,206 +565,152 @@ def train_face_expression_model(data_path, dx=1.0, dy=1.0, epochs=25):
             correct += pred.eq(labels).sum().item()
             total += labels.size(0)
 
-            if batch_idx % 50 == 0:
+            if batch_idx % 100 == 0:
                 print(f'Epoch {epoch+1}, Batch {batch_idx}, Loss: {loss.item():.4f}, Acc: {100.*correct/total:.2f}%')
 
         scheduler.step()
-        epoch_time = time.time() - start_time
-        avg_loss = total_loss / len(train_loader)
-        train_acc = 100. * correct / total
-
-        print(f"Epoch {epoch+1} - Loss: {avg_loss:.4f}, Train Acc: {train_acc:.2f}%, Time: {epoch_time:.2f}s")
-
-        # Monitor vector parameters
+        
+        # Validation
+        model.eval()
+        val_correct = 0
+        val_total = 0
+        val_loss = 0
+        
         with torch.no_grad():
-            alpha_x_stats = {
-                'base_mean': model.diff.alpha_base_x.mean().item(),
-                'base_std': model.diff.alpha_base_x.std().item(),
-                'time_mean': model.diff.alpha_time_coeff_x.mean().item(),
-                'quad_mean': model.diff.alpha_time_quad_x.mean().item()
-            }
+            for imgs, labels in test_loader:
+                imgs, labels = imgs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+                output = model(imgs)
+                val_loss += criterion(output, labels).item()
+                pred = output.argmax(dim=1)
+                val_correct += pred.eq(labels).sum().item()
+                val_total += labels.size(0)
+
+        val_acc = 100. * val_correct / val_total
+        train_acc = 100. * correct / total
+        avg_loss = total_loss / len(train_loader)
+        avg_val_loss = val_loss / len(test_loader)
+
+        print(f"Epoch {epoch+1} - Train Loss: {avg_loss:.4f}, Train Acc: {train_acc:.2f}%")
+        print(f"           Val Loss: {avg_val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+        
+        # Early stopping
+        if val_acc > best_acc:
+            best_acc = val_acc
+            patience_counter = 0
+            # Save best model
+            torch.save(model.state_dict(), 'best_model.pth')
+        else:
+            patience_counter += 1
             
-            beta_y_stats = {
-                'base_mean': model.diff.beta_base_y.mean().item(),
-                'base_std': model.diff.beta_base_y.std().item(),
-                'time_mean': model.diff.beta_time_coeff_y.mean().item(),
-                'quad_mean': model.diff.beta_time_quad_y.mean().item()
-            }
-
-            print(f"Vector Coefficients - αx: base μ={alpha_x_stats['base_mean']:.3f}±{alpha_x_stats['base_std']:.3f}, "
-                  f"linear={alpha_x_stats['time_mean']:.3f}, quad={alpha_x_stats['quad_mean']:.3f}")
-            print(f"                    - βy: base μ={beta_y_stats['base_mean']:.3f}±{beta_y_stats['base_std']:.3f}, "
-                  f"linear={beta_y_stats['time_mean']:.3f}, quad={beta_y_stats['quad_mean']:.3f}")
-
+        if patience_counter >= patience:
+            print(f"Early stopping at epoch {epoch+1}. Best validation accuracy: {best_acc:.2f}%")
+            break
+            
         print("-" * 80)
 
+    # Load best model
+    model.load_state_dict(torch.load('best_model.pth'))
     return model, test_loader
 
-
-# --- Enhanced Evaluation and Visualization ---
-def evaluate_and_visualize_emotions(model, test_loader):
-    """Evaluation and visualization for emotion recognition with vector coefficients"""
+# --- Updated evaluation function ---
+def evaluate_improved_model(model, test_loader):
+    """Evaluation function for improved model"""
     device = next(model.parameters()).device
     model.eval()
-    test_correct = 0
-    test_total = 0
+    
     all_preds = []
     all_labels = []
-
-    # Emotion labels
+    all_confidences = []
+    
     emotion_labels = ['Angry', 'Disgust', 'Fear', 'Happy', 'Sad', 'Surprise', 'Neutral']
-
+    
     with torch.no_grad():
         for imgs, labels in test_loader:
-            imgs, labels = imgs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+            imgs, labels = imgs.to(device), labels.to(device)
             output = model(imgs)
+            
+            # Get predictions and confidences
+            probs = F.softmax(output, dim=1)
             pred = output.argmax(dim=1)
-            test_correct += pred.eq(labels).sum().item()
-            test_total += labels.size(0)
-
+            confidence = probs.max(dim=1)[0]
+            
             all_preds.extend(pred.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
+            all_confidences.extend(confidence.cpu().numpy())
 
-    test_acc = 100. * test_correct / test_total
+    test_acc = 100. * sum(np.array(all_preds) == np.array(all_labels)) / len(all_labels)
+    avg_confidence = np.mean(all_confidences)
+    
     print(f"Test Accuracy: {test_acc:.2f}%")
-
-    # Classification report
+    print(f"Average Confidence: {avg_confidence:.3f}")
     print("\nClassification Report:")
     print(classification_report(all_labels, all_preds, target_names=emotion_labels))
 
-    # Enhanced visualization with vector coefficient analysis
-    plt.figure(figsize=(24, 18))
-
+    # Visualization
+    plt.figure(figsize=(20, 12))
+    
+    # Sample predictions
     with torch.no_grad():
         images, labels = next(iter(test_loader))
         images = images.to(device)
         outputs = model(images)
         predicted = outputs.argmax(dim=1)
+        confidences = F.softmax(outputs, dim=1).max(dim=1)[0]
 
-        # Sample images and predictions
         for i in range(min(8, len(images))):
-            # Original
-            plt.subplot(5, 8, i + 1)
+            # Original image
+            plt.subplot(3, 8, i + 1)
             img = images[i, 0].cpu().numpy()
-            # Denormalize for display
-            img = (img + 1) / 2  # Convert from [-1,1] to [0,1]
+            # Denormalize
+            img = img * 0.229 + 0.485
+            img = np.clip(img, 0, 1)
             plt.imshow(img, cmap='gray')
             plt.axis('off')
             plt.title(f"True: {emotion_labels[labels[i]]}", fontsize=8)
 
-            # Prediction
-            plt.subplot(5, 8, i + 9)
+            # Prediction with confidence
+            plt.subplot(3, 8, i + 9)
             plt.imshow(img, cmap='gray')
             plt.axis('off')
             color = 'green' if predicted[i] == labels[i] else 'red'
-            plt.title(f"Pred: {emotion_labels[predicted[i]]}", color=color, fontsize=8)
+            plt.title(f"Pred: {emotion_labels[predicted[i]]}\nConf: {confidences[i]:.2f}", 
+                     color=color, fontsize=8)
 
-            # Diffused
-            plt.subplot(5, 8, i + 17)
-            diffused = model.diff(images[i:i+1]).squeeze().cpu().numpy()
-            # Denormalize for display
-            diffused = (diffused + 1) / 2
+            # Processed by diffusion
+            plt.subplot(3, 8, i + 17)
+            diffused = model.diffusion(images[i:i+1]).squeeze().cpu().numpy()
+            diffused = diffused * 0.229 + 0.485
+            diffused = np.clip(diffused, 0, 1)
             plt.imshow(diffused, cmap='gray')
             plt.axis('off')
             plt.title("After PDE", fontsize=8)
 
-        # Vector coefficient visualization at final time
-        final_time = model.diff.num_steps * model.diff.dt
-        alpha_x_t, alpha_y_t, beta_x_t, beta_y_t = model.diff.get_alpha_beta_vectors_at_time(final_time)
+    # Confusion Matrix
+    plt.subplot(3, 8, 24)
+    cm = confusion_matrix(all_labels, all_preds)
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+               xticklabels=emotion_labels, yticklabels=emotion_labels,
+               cbar=False)
+    plt.title("Confusion Matrix", fontsize=10)
+    plt.xticks(rotation=45, fontsize=8)
+    plt.yticks(rotation=0, fontsize=8)
 
-        # Alpha vectors
-        plt.subplot(5, 8, 25)
-        plt.plot(alpha_x_t.cpu().numpy(), 'b-', label='αx(t_final)', linewidth=2)
-        plt.plot(alpha_y_t.cpu().numpy(), 'r--', label='αy(t_final)', linewidth=2)
-        plt.title("Alpha Vectors", fontsize=10)
-        plt.xlabel("Spatial Index")
-        plt.ylabel("Coefficient Value")
-        plt.legend(fontsize=8)
-        plt.grid(True, alpha=0.3)
+    plt.suptitle(f'Improved PDE-based Emotion Recognition (Test Acc: {test_acc:.2f}%)', fontsize=16)
+    plt.tight_layout()
+    plt.show()
+    
+    return test_acc
 
-        # Beta vectors
-        plt.subplot(5, 8, 26)
-        plt.plot(beta_x_t.cpu().numpy(), 'g-', label='βx(t_final)', linewidth=2)
-        plt.plot(beta_y_t.cpu().numpy(), 'm--', label='βy(t_final)', linewidth=2)
-        plt.title("Beta Vectors", fontsize=10)
-        plt.xlabel("Spatial Index")
-        plt.ylabel("Coefficient Value")
-        plt.legend(fontsize=8)
-        plt.grid(True, alpha=0.3)
+# --- Main execution ---
+def run_improved_emotion_recognition():
+    """Run the improved emotion recognition system"""
+    print("🚀 Starting Improved PDE-based Emotion Recognition System")
+    print("=" * 60)
 
-        # Time evolution of mean coefficients
-        evolution = model.diff.get_coefficient_evolution()
-        plt.subplot(5, 8, 27)
-        plt.plot(evolution['time'], evolution['alpha_x'], 'b-', label='mean(αx)', linewidth=2)
-        plt.plot(evolution['time'], evolution['alpha_y'], 'r--', label='mean(αy)', linewidth=2)
-        plt.plot(evolution['time'], evolution['beta_x'], 'g:', label='mean(βx)', linewidth=2)
-        plt.plot(evolution['time'], evolution['beta_y'], 'm-.', label='mean(βy)', linewidth=2)
-        plt.title("Coefficient Evolution", fontsize=10)
-        plt.xlabel("Time")
-        plt.ylabel("Mean Coefficient Value")
-        plt.legend(fontsize=8)
-        plt.grid(True, alpha=0.3)
-
-        # Confusion Matrix
-        plt.subplot(5, 8, 28)
-        cm = confusion_matrix(all_labels, all_preds)
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                   xticklabels=emotion_labels, yticklabels=emotion_labels,
-                   cbar=False)
-        plt.title("Confusion Matrix", fontsize=10)
-        plt.xticks(rotation=45, fontsize=6)
-        plt.yticks(rotation=0, fontsize=6)
-
-        # Coefficient matrices visualization (convert vectors to matrices for display)
-        alpha_matrix_x = model.diff.expand_vector_to_matrix(alpha_x_t, alpha_y_t, direction='x')
-        beta_matrix_y = model.diff.expand_vector_to_matrix(beta_x_t, beta_y_t, direction='y')
-
-        plt.subplot(5, 8, 33)
-        im = plt.imshow(alpha_matrix_x.cpu().numpy(), cmap='RdBu_r', aspect='auto')
-        plt.colorbar(im, fraction=0.046, pad=0.04)
-        plt.title("Alpha Matrix (X-dir)", fontsize=8)
-        plt.axis('off')
-
-        plt.subplot(5, 8, 34)
-        im = plt.imshow(beta_matrix_y.cpu().numpy(), cmap='RdBu_r', aspect='auto')
-        plt.colorbar(im, fraction=0.046, pad=0.04)
-        plt.title("Beta Matrix (Y-dir)", fontsize=8)
-        plt.axis('off')
-
-        # Vector parameter statistics
-        stability_info = model.diff.get_numerical_stability_info()
-        plt.subplot(5, 8, 35)
-        plt.axis('off')
-        info_text = f"""Vector Coefficient Model
-        
-Total Parameters: {stability_info['total_vector_params']}
-CFL X: {stability_info['cfl_x']:.3f}
-CFL Y: {stability_info['cfl_y']:.3f}
-Stable: {stability_info['stable_x'] and stability_info['stable_y']}
-
-Max Coefficients:
-αx: {stability_info['max_alpha_x']:.3f}
-αy: {stability_info['max_alpha_y']:.3f}
-βx: {stability_info['max_beta_x']:.3f}
-βy: {stability_info['max_beta_y']:.3f}"""
-        plt.text(0.1, 0.9, info_text, fontsize=8, verticalalignment='top',
-                bbox=dict(boxstyle="round,pad=0.3", facecolor="lightblue"))
-
-        plt.suptitle(f'PDE-based Face Expression Recognition with Vector Coefficients (Test Acc: {test_acc:.2f}%)', fontsize=16)
-        plt.tight_layout()
-        plt.show()
-
-
-# --- Main execution function ---
-def run_pde_emotion_recognition():
-    """Complete pipeline for PDE-based emotion recognition with vector coefficients"""
-    print("🚀 Starting PDE-based Emotion Recognition System (Vector Coefficients)")
-    print("=" * 70)
-
-    # Download dataset
+    # Download and setup dataset
     dataset_path = download_and_setup_dataset()
-
-    # First, try to find CSV files
+    
+    # Find data path
     data_files = []
     for root, dirs, files in os.walk(dataset_path):
         for file in files:
@@ -918,65 +718,28 @@ def run_pde_emotion_recognition():
                 data_files.append(os.path.join(root, file))
 
     if data_files:
-        # Use CSV format
         data_path = data_files[0]
         print(f"Using CSV file: {data_path}")
     else:
         # Use directory format
-        print("No CSV files found. Looking for image directories...")
+        print("Looking for image directories...")
         train_dir, val_dir = find_data_directories(dataset_path)
+        data_path = train_dir if train_dir else dataset_path
+        print(f"Using directory: {data_path}")
 
-        if train_dir:
-            data_path = train_dir
-            print(f"Using training directory: {data_path}")
+    print(f"\n🧠 Training Improved Model...")
+    print("=" * 60)
 
-            # Check if this directory contains emotion subdirectories
-            emotion_dirs = []
-            emotion_names = ['angry', 'disgust', 'fear', 'happy', 'sad', 'surprise', 'neutral']
+    # Train improved model
+    model, test_loader = train_improved_model(data_path, dx=1.0, dy=1.0, epochs=30)
 
-            for emotion in emotion_names:
-                emotion_path = os.path.join(data_path, emotion)
-                if os.path.exists(emotion_path):
-                    emotion_dirs.append(emotion)
-                    file_count = len([f for f in os.listdir(emotion_path)
-                                    if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))])
-                    print(f"  - {emotion}: {file_count} images")
+    print("\n📊 Evaluating Improved Model...")
+    print("=" * 60)
+    test_acc = evaluate_improved_model(model, test_loader)
 
-            if not emotion_dirs:
-                print(f"No emotion directories found in {data_path}")
-                # Try looking for numbered directories or other formats
-                subdirs = [d for d in os.listdir(data_path) if os.path.isdir(os.path.join(data_path, d))]
-                print(f"Available subdirectories: {subdirs}")
-                return None, None
+    print(f"\n✅ Training completed! Final test accuracy: {test_acc:.2f}%")
+    return model, test_loader
 
-        else:
-            print(f"No suitable data directories found. Using base directory: {dataset_path}")
-            data_path = dataset_path
-
-    print(f"\n🧠 Training PDE-Enhanced Neural Network with Vector Coefficients...")
-    print("=" * 70)
-
-    # Train model with vector-based diffusion coefficients
-    model, test_loader = train_face_expression_model(data_path, dx=1.0, dy=1.0, epochs=25)
-
-    if model is not None:
-        print("\n📊 Evaluating Model Performance...")
-        print("=" * 70)
-        evaluate_and_visualize_emotions(model, test_loader)
-
-        print("\n✅ Training and evaluation completed successfully!")
-        print("🔬 Key improvements with vector coefficients:")
-        print("   - Reduced parameter count from matrix to vector form")
-        print("   - Time-dependent quadratic evolution for richer dynamics")
-        print("   - Separate x/y direction control for anisotropic diffusion")
-        print("   - Enhanced numerical stability monitoring")
-        return model, test_loader
-    else:
-        print("❌ Training failed. Please check the dataset format and path.")
-        return None, None
-
-
-# --- Run the complete system ---
+# Run the improved system
 if __name__ == "__main__":
-    # Run the complete PDE emotion recognition system with vector coefficients
-    model, test_loader = run_pde_emotion_recognition()
+    model, test_loader = run_improved_emotion_recognition()
