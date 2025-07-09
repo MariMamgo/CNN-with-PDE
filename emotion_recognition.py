@@ -50,23 +50,18 @@ class PDELayer(nn.Module):
         self.dy = Ly / Ny
         self.Nt = int(T / dt)
 
-        # Original alpha parameters
-        self.alpha_w1 = nn.Parameter(torch.tensor(0.04))
-        self.alpha_w2 = nn.Parameter(torch.tensor(0.01))
-        
-        # Additional alpha parameters for extended Fourier series
-        self.alpha_w3 = nn.Parameter(torch.tensor(0.1))
-        self.alpha_w4 = nn.Parameter(torch.tensor(0.1))
-        self.alpha_w5 = nn.Parameter(torch.tensor(0.1))
+        # BETTER initialization - start with positive values
+        self.alpha_w1 = nn.Parameter(torch.tensor(0.5))   # Increased
+        self.alpha_w2 = nn.Parameter(torch.tensor(0.01))  # Smaller harmonics
+        self.alpha_w3 = nn.Parameter(torch.tensor(0.01))
+        self.alpha_w4 = nn.Parameter(torch.tensor(0.01))
+        self.alpha_w5 = nn.Parameter(torch.tensor(0.01))
 
-        # Original beta parameters
-        self.beta_w1 = nn.Parameter(torch.tensor(0.2))
-        self.beta_w2 = nn.Parameter(torch.tensor(0.03))
-        
-        # Additional beta parameters for extended Fourier series
-        self.beta_w3 = nn.Parameter(torch.tensor(0.1))
-        self.beta_w4 = nn.Parameter(torch.tensor(0.1))
-        self.beta_w5 = nn.Parameter(torch.tensor(0.1))
+        self.beta_w1 = nn.Parameter(torch.tensor(0.5))    # Increased
+        self.beta_w2 = nn.Parameter(torch.tensor(0.01))   # Smaller harmonics
+        self.beta_w3 = nn.Parameter(torch.tensor(0.01))
+        self.beta_w4 = nn.Parameter(torch.tensor(0.01))
+        self.beta_w5 = nn.Parameter(torch.tensor(0.01))
 
         self.register_buffer('x', torch.linspace(0, Lx, Nx))
         self.register_buffer('y', torch.linspace(0, Ly, Ny))
@@ -204,23 +199,41 @@ class DiffusionClassifier(nn.Module):
 def train(model, device, train_loader, optimizer, criterion, epoch):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
+    
     for images, labels in train_loader:
         images, labels = images.to(device), labels.to(device)
+        
+        optimizer.zero_grad()
         outputs = model(images)
         loss = criterion(outputs, labels)
-        optimizer.zero_grad()
+        
+        # Check for NaN/Inf
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"Warning: Invalid loss detected: {loss.item()}")
+            continue
+            
         loss.backward()
+        
+        # GRADIENT CLIPPING for stability
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
         optimizer.step()
+        
         total_loss += loss.item() * images.size(0)
         _, predicted = outputs.max(1)
         correct += predicted.eq(labels).sum().item()
         total += labels.size(0)
-    print(f"Epoch {epoch+1}: Loss={total_loss/total:.4f}, Accuracy={100*correct/total:.2f}%")
+    
+    avg_loss = total_loss / total
+    accuracy = 100 * correct / total
+    
+    print(f"Epoch {epoch+1}: Loss={avg_loss:.4f}, Accuracy={accuracy:.2f}%")
     print(f"  alpha_w1={model.pde.alpha_w1.item():.4f}, alpha_w2={model.pde.alpha_w2.item():.4f}, alpha_w3={model.pde.alpha_w3.item():.4f}")
     print(f"  alpha_w4={model.pde.alpha_w4.item():.4f}, alpha_w5={model.pde.alpha_w5.item():.4f}")
     print(f"  beta_w1= {model.pde.beta_w1.item():.4f}, beta_w2= {model.pde.beta_w2.item():.4f}, beta_w3= {model.pde.beta_w3.item():.4f}")
     print(f"  beta_w4= {model.pde.beta_w4.item():.4f}, beta_w5= {model.pde.beta_w5.item():.4f}")
-
+    
+    return avg_loss
 def evaluate(model, device, test_loader):
     model.eval()
     correct, total = 0, 0
@@ -304,12 +317,18 @@ def main():
 
     model = DiffusionClassifier(img_size=48, num_classes=7).to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    
+    # REDUCED learning rate for stability
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)  # Changed from 0.001
+    
+    # Add learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
 
     print(f"Starting training with {len(train_dataset)} training samples and {len(test_dataset)} test samples")
 
     for epoch in range(70):
-        train(model, device, train_loader, optimizer, criterion, epoch)
+        train_loss = train(model, device, train_loader, optimizer, criterion, epoch)
+        scheduler.step(train_loss)  # Reduce LR when loss plateaus
 
     evaluate(model, device, test_loader)
 
