@@ -52,16 +52,13 @@ class PDELayer(nn.Module):
 
         # Initialize with positive values (abs() will keep them positive)
         self.alpha_w1 = nn.Parameter(torch.tensor(0.1))
-        self.alpha_w2 = nn.Parameter(torch.tensor(0.05))
-        self.alpha_w3 = nn.Parameter(torch.tensor(0.05))
-        self.alpha_w4 = nn.Parameter(torch.tensor(0.05))
-        self.alpha_w5 = nn.Parameter(torch.tensor(0.05))
+        self.alpha_w2 = nn.Parameter(torch.tensor(0.1))
+        self.alpha_w3 = nn.Parameter(torch.tensor(0.1))
+
 
         self.beta_w1 = nn.Parameter(torch.tensor(0.3))
         self.beta_w2 = nn.Parameter(torch.tensor(0.2))
         self.beta_w3 = nn.Parameter(torch.tensor(0.1))
-        self.beta_w4 = nn.Parameter(torch.tensor(0.1))
-        self.beta_w5 = nn.Parameter(torch.tensor(0.1))
 
         self.register_buffer('x', torch.linspace(0, Lx, Nx))
         self.register_buffer('y', torch.linspace(0, Ly, Ny))
@@ -72,8 +69,6 @@ class PDELayer(nn.Module):
             torch.abs(self.alpha_w1) + 
             torch.abs(self.alpha_w2) * torch.sin(2 * torch.pi * y_val) +
             torch.abs(self.alpha_w3) * torch.cos(2 * torch.pi * y_val) +
-            torch.abs(self.alpha_w4) * torch.sin(4 * torch.pi * y_val) +
-            torch.abs(self.alpha_w5) * torch.cos(4 * torch.pi * y_val)
         )
         return 0.5 * self.dt * fourier_terms / self.dx**2
 
@@ -83,8 +78,6 @@ class PDELayer(nn.Module):
             torch.abs(self.beta_w1) + 
             torch.abs(self.beta_w2) * torch.cos(2 * torch.pi * x_val) +
             torch.abs(self.beta_w3) * torch.sin(2 * torch.pi * x_val) +
-            torch.abs(self.beta_w4) * torch.cos(4 * torch.pi * x_val) +
-            torch.abs(self.beta_w5) * torch.sin(4 * torch.pi * x_val)
         )
         return self.dt * fourier_terms / self.dy**2
 
