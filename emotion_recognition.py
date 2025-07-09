@@ -75,18 +75,18 @@ class PDELayer(nn.Module):
         return self.dt * (
             self.alpha_w1 + 
             self.alpha_w2 * torch.sin(2 * torch.pi * y_val) +
-            self.alpha_w3 * torch.cos(2 * torch.pi * y_val) +
-            self.alpha_w4 * torch.sin(4 * torch.pi * y_val) +
-            self.alpha_w5 * torch.cos(4 * torch.pi * y_val)
+            self.alpha_w3 * torch.sin(4 * torch.pi * y_val) +
+            self.alpha_w4 * torch.sin(6 * torch.pi * y_val) +
+            self.alpha_w5 * torch.sin(8 * torch.pi * y_val)
         ) / self.dx**2
 
     def beta(self, x_val):
         return self.dt * (
             self.beta_w1 + 
             self.beta_w2 * torch.cos(2 * torch.pi * x_val) +
-            self.beta_w3 * torch.sin(2 * torch.pi * x_val) +
-            self.beta_w4 * torch.cos(4 * torch.pi * x_val) +
-            self.beta_w5 * torch.sin(4 * torch.pi * x_val)
+            self.beta_w3 * torch.cos(4 * torch.pi * x_val) +
+            self.beta_w4 * torch.cos(6 * torch.pi * x_val) +
+            self.beta_w5 * torch.cos(8 * torch.pi * x_val)
         ) / self.dy**2
 
     def forward(self, u0):
