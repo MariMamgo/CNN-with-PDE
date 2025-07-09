@@ -72,22 +72,24 @@ class PDELayer(nn.Module):
         self.register_buffer('y', torch.linspace(0, Ly, Ny))
 
     def alpha(self, y_val):
-        return self.dt * (
+        fourier_terms = (
             self.alpha_w1 + 
             self.alpha_w2 * torch.sin(2 * torch.pi * y_val) +
-            self.alpha_w3 * torch.sin(4 * torch.pi * y_val) +
-            self.alpha_w4 * torch.sin(6 * torch.pi * y_val) +
-            self.alpha_w5 * torch.sin(8 * torch.pi * y_val)
-        ) / self.dx**2
+            self.alpha_w3 * torch.cos(2 * torch.pi * y_val) +
+            self.alpha_w4 * torch.sin(4 * torch.pi * y_val) +
+            self.alpha_w5 * torch.cos(4 * torch.pi * y_val)
+        )
+        return 0.5 * self.dt * F.softplus(fourier_terms) / self.dx**2
 
     def beta(self, x_val):
-        return self.dt * (
+        fourier_terms = (
             self.beta_w1 + 
             self.beta_w2 * torch.cos(2 * torch.pi * x_val) +
-            self.beta_w3 * torch.cos(4 * torch.pi * x_val) +
-            self.beta_w4 * torch.cos(6 * torch.pi * x_val) +
-            self.beta_w5 * torch.cos(8 * torch.pi * x_val)
-        ) / self.dy**2
+            self.beta_w3 * torch.sin(2 * torch.pi * x_val) +
+            self.beta_w4 * torch.cos(4 * torch.pi * x_val) +
+            self.beta_w5 * torch.sin(4 * torch.pi * x_val)
+        )
+        return self.dt * F.softplus(fourier_terms) / self.dy**2
 
     def forward(self, u0):
         u = u0.squeeze(1)  # (B, 48, 48)
