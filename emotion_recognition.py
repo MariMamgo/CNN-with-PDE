@@ -68,8 +68,8 @@ class PDELayer(nn.Module):
         self.beta_w4 = nn.Parameter(torch.tensor(0.1))
         self.beta_w5 = nn.Parameter(torch.tensor(0.1))
 
-        self.x = torch.linspace(0, Lx, Nx)
-        self.y = torch.linspace(0, Ly, Ny)
+        self.register_buffer('x', torch.linspace(0, Lx, Nx))
+        self.register_buffer('y', torch.linspace(0, Ly, Ny))
 
     def alpha(self, y_val):
         return 0.5 * self.dt * (
