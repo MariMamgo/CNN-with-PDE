@@ -68,7 +68,7 @@ class PDELayer(nn.Module):
         fourier_terms = (
             torch.abs(self.alpha_w1) + 
             torch.abs(self.alpha_w2) * torch.sin(2 * torch.pi * y_val) +
-            torch.abs(self.alpha_w3) * torch.cos(2 * torch.pi * y_val) +
+            torch.abs(self.alpha_w3) * torch.cos(2 * torch.pi * y_val) 
         )
         return 0.5 * self.dt * fourier_terms / self.dx**2
 
@@ -77,7 +77,7 @@ class PDELayer(nn.Module):
         fourier_terms = (
             torch.abs(self.beta_w1) + 
             torch.abs(self.beta_w2) * torch.cos(2 * torch.pi * x_val) +
-            torch.abs(self.beta_w3) * torch.sin(2 * torch.pi * x_val) +
+            torch.abs(self.beta_w3) * torch.sin(2 * torch.pi * x_val) 
         )
         return self.dt * fourier_terms / self.dy**2
 
