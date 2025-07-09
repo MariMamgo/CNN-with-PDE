@@ -50,41 +50,43 @@ class PDELayer(nn.Module):
         self.dy = Ly / Ny
         self.Nt = int(T / dt)
 
-        # BETTER initialization - start with positive values
-        self.alpha_w1 = nn.Parameter(torch.tensor(0.5))   # Increased
-        self.alpha_w2 = nn.Parameter(torch.tensor(0.01))  # Smaller harmonics
-        self.alpha_w3 = nn.Parameter(torch.tensor(0.01))
-        self.alpha_w4 = nn.Parameter(torch.tensor(0.01))
-        self.alpha_w5 = nn.Parameter(torch.tensor(0.01))
+        # Initialize with positive values (abs() will keep them positive)
+        self.alpha_w1 = nn.Parameter(torch.tensor(0.1))
+        self.alpha_w2 = nn.Parameter(torch.tensor(0.05))
+        self.alpha_w3 = nn.Parameter(torch.tensor(0.05))
+        self.alpha_w4 = nn.Parameter(torch.tensor(0.05))
+        self.alpha_w5 = nn.Parameter(torch.tensor(0.05))
 
-        self.beta_w1 = nn.Parameter(torch.tensor(0.5))    # Increased
-        self.beta_w2 = nn.Parameter(torch.tensor(0.01))   # Smaller harmonics
-        self.beta_w3 = nn.Parameter(torch.tensor(0.01))
-        self.beta_w4 = nn.Parameter(torch.tensor(0.01))
-        self.beta_w5 = nn.Parameter(torch.tensor(0.01))
+        self.beta_w1 = nn.Parameter(torch.tensor(0.3))
+        self.beta_w2 = nn.Parameter(torch.tensor(0.2))
+        self.beta_w3 = nn.Parameter(torch.tensor(0.1))
+        self.beta_w4 = nn.Parameter(torch.tensor(0.1))
+        self.beta_w5 = nn.Parameter(torch.tensor(0.1))
 
         self.register_buffer('x', torch.linspace(0, Lx, Nx))
         self.register_buffer('y', torch.linspace(0, Ly, Ny))
 
     def alpha(self, y_val):
+        # Ensure ALL coefficients are positive using abs()
         fourier_terms = (
-            self.alpha_w1 + 
-            self.alpha_w2 * torch.sin(2 * torch.pi * y_val) +
-            self.alpha_w3 * torch.cos(2 * torch.pi * y_val) +
-            self.alpha_w4 * torch.sin(4 * torch.pi * y_val) +
-            self.alpha_w5 * torch.cos(4 * torch.pi * y_val)
+            torch.abs(self.alpha_w1) + 
+            torch.abs(self.alpha_w2) * torch.sin(2 * torch.pi * y_val) +
+            torch.abs(self.alpha_w3) * torch.cos(2 * torch.pi * y_val) +
+            torch.abs(self.alpha_w4) * torch.sin(4 * torch.pi * y_val) +
+            torch.abs(self.alpha_w5) * torch.cos(4 * torch.pi * y_val)
         )
-        return 0.5 * self.dt * F.softplus(fourier_terms) / self.dx**2
+        return 0.5 * self.dt * fourier_terms / self.dx**2
 
     def beta(self, x_val):
+        # Ensure ALL coefficients are positive using abs()
         fourier_terms = (
-            self.beta_w1 + 
-            self.beta_w2 * torch.cos(2 * torch.pi * x_val) +
-            self.beta_w3 * torch.sin(2 * torch.pi * x_val) +
-            self.beta_w4 * torch.cos(4 * torch.pi * x_val) +
-            self.beta_w5 * torch.sin(4 * torch.pi * x_val)
+            torch.abs(self.beta_w1) + 
+            torch.abs(self.beta_w2) * torch.cos(2 * torch.pi * x_val) +
+            torch.abs(self.beta_w3) * torch.sin(2 * torch.pi * x_val) +
+            torch.abs(self.beta_w4) * torch.cos(4 * torch.pi * x_val) +
+            torch.abs(self.beta_w5) * torch.sin(4 * torch.pi * x_val)
         )
-        return self.dt * F.softplus(fourier_terms) / self.dy**2
+        return self.dt * fourier_terms / self.dy**2
 
     def forward(self, u0):
         u = u0.squeeze(1)  # (B, 48, 48)
@@ -195,7 +197,8 @@ class DiffusionClassifier(nn.Module):
         x = self.pde(x)
         return self.classifier(x)
 
-# Updated Training Function with Extended Parameter Logging
+
+# Simplified training function - no regularization needed
 def train(model, device, train_loader, optimizer, criterion, epoch):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
@@ -214,7 +217,7 @@ def train(model, device, train_loader, optimizer, criterion, epoch):
             
         loss.backward()
         
-        # GRADIENT CLIPPING for stability
+        # Light gradient clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         
         optimizer.step()
@@ -234,6 +237,7 @@ def train(model, device, train_loader, optimizer, criterion, epoch):
     print(f"  beta_w4= {model.pde.beta_w4.item():.4f}, beta_w5= {model.pde.beta_w5.item():.4f}")
     
     return avg_loss
+    
 def evaluate(model, device, test_loader):
     model.eval()
     correct, total = 0, 0
@@ -317,18 +321,12 @@ def main():
 
     model = DiffusionClassifier(img_size=48, num_classes=7).to(device)
     criterion = nn.CrossEntropyLoss()
-    
-    # REDUCED learning rate for stability
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)  # Changed from 0.001
-    
-    # Add learning rate scheduler
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)  # Back to normal LR
 
     print(f"Starting training with {len(train_dataset)} training samples and {len(test_dataset)} test samples")
 
     for epoch in range(70):
-        train_loss = train(model, device, train_loader, optimizer, criterion, epoch)
-        scheduler.step(train_loss)  # Reduce LR when loss plateaus
+        train(model, device, train_loader, optimizer, criterion, epoch)
 
     evaluate(model, device, test_loader)
 
