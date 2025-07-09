@@ -225,9 +225,7 @@ def train(model, device, train_loader, optimizer, criterion, epoch):
     
     print(f"Epoch {epoch+1}: Loss={avg_loss:.4f}, Accuracy={accuracy:.2f}%")
     print(f"  alpha_w1={model.pde.alpha_w1.item():.4f}, alpha_w2={model.pde.alpha_w2.item():.4f}, alpha_w3={model.pde.alpha_w3.item():.4f}")
-    print(f"  alpha_w4={model.pde.alpha_w4.item():.4f}, alpha_w5={model.pde.alpha_w5.item():.4f}")
     print(f"  beta_w1= {model.pde.beta_w1.item():.4f}, beta_w2= {model.pde.beta_w2.item():.4f}, beta_w3= {model.pde.beta_w3.item():.4f}")
-    print(f"  beta_w4= {model.pde.beta_w4.item():.4f}, beta_w5= {model.pde.beta_w5.item():.4f}")
     
     return avg_loss
     
