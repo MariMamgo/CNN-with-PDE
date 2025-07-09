@@ -55,9 +55,9 @@ class PDELayer(nn.Module):
         self.alpha_w2 = nn.Parameter(torch.tensor(0.1))
         
         # Additional alpha parameters for extended Fourier series
-        self.alpha_w3 = nn.Parameter(torch.tensor(0.05))
-        self.alpha_w4 = nn.Parameter(torch.tensor(0.05))
-        self.alpha_w5 = nn.Parameter(torch.tensor(0.05))
+        self.alpha_w3 = nn.Parameter(torch.tensor(0.1))
+        self.alpha_w4 = nn.Parameter(torch.tensor(0.1))
+        self.alpha_w5 = nn.Parameter(torch.tensor(0.1))
 
         # Original beta parameters
         self.beta_w1 = nn.Parameter(torch.tensor(0.3))
@@ -72,7 +72,7 @@ class PDELayer(nn.Module):
         self.register_buffer('y', torch.linspace(0, Ly, Ny))
 
     def alpha(self, y_val):
-        return 0.5 * self.dt * (
+        return self.dt * (
             self.alpha_w1 + 
             self.alpha_w2 * torch.sin(2 * torch.pi * y_val) +
             self.alpha_w3 * torch.cos(2 * torch.pi * y_val) +
