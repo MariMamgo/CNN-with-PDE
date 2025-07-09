@@ -51,8 +51,8 @@ class PDELayer(nn.Module):
         self.Nt = int(T / dt)
 
         # Original alpha parameters
-        self.alpha_w1 = nn.Parameter(torch.tensor(0.1))
-        self.alpha_w2 = nn.Parameter(torch.tensor(0.1))
+        self.alpha_w1 = nn.Parameter(torch.tensor(0.04))
+        self.alpha_w2 = nn.Parameter(torch.tensor(0.01))
         
         # Additional alpha parameters for extended Fourier series
         self.alpha_w3 = nn.Parameter(torch.tensor(0.1))
@@ -60,8 +60,8 @@ class PDELayer(nn.Module):
         self.alpha_w5 = nn.Parameter(torch.tensor(0.1))
 
         # Original beta parameters
-        self.beta_w1 = nn.Parameter(torch.tensor(0.3))
-        self.beta_w2 = nn.Parameter(torch.tensor(0.2))
+        self.beta_w1 = nn.Parameter(torch.tensor(0.2))
+        self.beta_w2 = nn.Parameter(torch.tensor(0.03))
         
         # Additional beta parameters for extended Fourier series
         self.beta_w3 = nn.Parameter(torch.tensor(0.1))
