@@ -53,12 +53,10 @@ class PDELayer(nn.Module):
         # Initialize with positive values (abs() will keep them positive)
         self.alpha_w1 = nn.Parameter(torch.tensor(0.1))
         self.alpha_w2 = nn.Parameter(torch.tensor(0.1))
-        self.alpha_w3 = nn.Parameter(torch.tensor(0.1))
 
 
         self.beta_w1 = nn.Parameter(torch.tensor(0.3))
         self.beta_w2 = nn.Parameter(torch.tensor(0.2))
-        self.beta_w3 = nn.Parameter(torch.tensor(0.1))
 
         self.register_buffer('x', torch.linspace(0, Lx, Nx))
         self.register_buffer('y', torch.linspace(0, Ly, Ny))
@@ -67,8 +65,7 @@ class PDELayer(nn.Module):
         # Ensure ALL coefficients are positive using abs()
         fourier_terms = (
             torch.abs(self.alpha_w1) + 
-            torch.abs(self.alpha_w2) * torch.sin(2 * torch.pi * y_val) +
-            torch.abs(self.alpha_w3) * torch.cos(2 * torch.pi * y_val) 
+            torch.abs(self.alpha_w2) * torch.sin(2 * torch.pi * y_val) 
         )
         return 0.5 * self.dt * fourier_terms / self.dx**2
 
@@ -76,8 +73,7 @@ class PDELayer(nn.Module):
         # Ensure ALL coefficients are positive using abs()
         fourier_terms = (
             torch.abs(self.beta_w1) + 
-            torch.abs(self.beta_w2) * torch.cos(2 * torch.pi * x_val) +
-            torch.abs(self.beta_w3) * torch.sin(2 * torch.pi * x_val) 
+            torch.abs(self.beta_w2) * torch.cos(2 * torch.pi * x_val) 
         )
         return self.dt * fourier_terms / self.dy**2
 
@@ -224,8 +220,8 @@ def train(model, device, train_loader, optimizer, criterion, epoch):
     accuracy = 100 * correct / total
     
     print(f"Epoch {epoch+1}: Loss={avg_loss:.4f}, Accuracy={accuracy:.2f}%")
-    print(f"  alpha_w1={model.pde.alpha_w1.item():.4f}, alpha_w2={model.pde.alpha_w2.item():.4f}, alpha_w3={model.pde.alpha_w3.item():.4f}")
-    print(f"  beta_w1= {model.pde.beta_w1.item():.4f}, beta_w2= {model.pde.beta_w2.item():.4f}, beta_w3= {model.pde.beta_w3.item():.4f}")
+    print(f"  alpha_w1={model.pde.alpha_w1.item():.4f}, alpha_w2={model.pde.alpha_w2.item():.4f}")
+    print(f"  beta_w1= {model.pde.beta_w1.item():.4f}, beta_w2= {model.pde.beta_w2.item():.4f}")
     
     return avg_loss
     
