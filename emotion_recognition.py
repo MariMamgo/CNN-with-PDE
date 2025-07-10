@@ -315,4 +315,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    path = kagglehub.dataset_download("jonathanoheix/face-expression-recognition-dataset")
+    print("Path to dataset files:", path)
+    main(path)
+
