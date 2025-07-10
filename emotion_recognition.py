@@ -98,7 +98,7 @@ class PDELayer(nn.Module):
 
 #Improved Emotion Dataset with Data Augmentation
 class EmotionDataset(Dataset):
-    def __init__(self, root_dir, split='train', transform=None, balance_classes=False):
+    def __init__(self, root_dir, transform=None, balance_classes=False):
         self.root_dir = root_dir
         self.transform = transform
         self.images = []
@@ -111,52 +111,22 @@ class EmotionDataset(Dataset):
             'sad': 4, 'surprise': 5, 'neutral': 6
         }
 
-        # Look for images in the specified split directory
-        split_dir = os.path.join(root_dir, 'images', split)
-        if not os.path.exists(split_dir):
-            # Try alternative split names
-            possible_splits = ['test', 'val', 'train', 'validation']
-            split_dir = None
-            for alt_split in possible_splits:
-                alt_path = os.path.join(root_dir, 'images', alt_split)
-                if os.path.exists(alt_path):
-                    split_dir = alt_path
-                    print(f"Using {alt_split} directory")
-                    break
+        # Load images directly from root_dir (which should be 'train/' or 'validation/')
+        if not os.path.exists(root_dir):
+            raise ValueError(f"Directory {root_dir} not found!")
 
-            if split_dir is None:
-                # Check if images are directly organized by emotion
-                images_dir = os.path.join(root_dir, 'images')
-                if os.path.exists(images_dir):
-                    subdirs = [d for d in os.listdir(images_dir) if os.path.isdir(os.path.join(images_dir, d))]
-                    print(f"Found subdirectories in images: {subdirs}")
-
-                    # Use the images directory directly and look for emotion folders
-                    for emotion_folder in subdirs:
-                        if emotion_folder.lower() in self.emotion_to_idx:
-                            emotion_path = os.path.join(images_dir, emotion_folder)
-                            emotion_idx = self.emotion_to_idx[emotion_folder.lower()]
-
-                            for img_file in os.listdir(emotion_path):
-                                if img_file.lower().endswith(('.png', '.jpg', '.jpeg')):
-                                    self.images.append(os.path.join(emotion_path, img_file))
-                                    self.labels.append(emotion_idx)
-                return
-
-        # Load images from split directory organized by emotion
-        for emotion_folder in os.listdir(split_dir):
-            emotion_path = os.path.join(split_dir, emotion_folder)
+        for emotion_folder in os.listdir(root_dir):
+            emotion_path = os.path.join(root_dir, emotion_folder)
             if os.path.isdir(emotion_path) and emotion_folder.lower() in self.emotion_to_idx:
                 emotion_idx = self.emotion_to_idx[emotion_folder.lower()]
-
                 for img_file in os.listdir(emotion_path):
                     if img_file.lower().endswith(('.png', '.jpg', '.jpeg')):
                         self.images.append(os.path.join(emotion_path, img_file))
                         self.labels.append(emotion_idx)
 
-        # Balance classes if requested
         if self.balance_classes:
             self._balance_dataset()
+
 
     def _balance_dataset(self):
         # Count samples per class
@@ -322,22 +292,16 @@ def main(path):
             print("Subdirectories:", subdirs)
 
         # Create datasets with improvements
-        train_dataset = EmotionDataset(dataset_path, split='train', 
-                                     transform=train_transform, balance_classes=True)
+        # Explicitly specify train and validation directories
+        train_dir = os.path.join(dataset_path, 'images', 'train')
+        val_dir = os.path.join(dataset_path, 'images', 'validation')
+    
+        train_dataset = EmotionDataset(train_dir, transform=train_transform, balance_classes=True)
+        test_dataset = EmotionDataset(val_dir, transform=test_transform)
+    
         print(f"Train dataset loaded: {len(train_dataset)} images")
+        print(f"Test dataset loaded: {len(test_dataset)} images")
 
-        # Try different splits for test data
-        test_splits = ['test', 'validation', 'val']
-        test_dataset = None
-        for test_split in test_splits:
-            try:
-                test_dataset = EmotionDataset(dataset_path, split=test_split, 
-                                            transform=test_transform)
-                if len(test_dataset) > 0:
-                    print(f"Test dataset loaded from '{test_split}': {len(test_dataset)} images")
-                    break
-            except:
-                continue
 
         if test_dataset is None or len(test_dataset) == 0:
             print("No test dataset found, using 20% of train data for testing")
