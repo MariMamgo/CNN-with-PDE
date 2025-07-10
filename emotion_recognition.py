@@ -296,7 +296,7 @@ def main(path):
         train_dir = os.path.join(dataset_path, 'images', 'train')
         val_dir = os.path.join(dataset_path, 'images', 'validation')
     
-        train_dataset = EmotionDataset(train_dir, transform=train_transform, balance_classes=True)
+        train_dataset = EmotionDataset(train_dir, transform=train_transform, balance_classes=False)
         test_dataset = EmotionDataset(val_dir, transform=test_transform)
     
         print(f"Train dataset loaded: {len(train_dataset)} images")
