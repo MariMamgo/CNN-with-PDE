@@ -207,12 +207,11 @@ def evaluate(model, device, test_loader):
     print(f"Test Accuracy: {100*correct/total:.2f}%")
 
 
-def main():
+def main(path):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Check available files in the dataset directory
-    dataset_path = "/kaggle/input/face-expression-recognition-dataset"
+    dataset_path = path
     print(f"Checking files in {dataset_path}:")
     try:
         files = os.listdir(dataset_path)
