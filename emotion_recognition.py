@@ -1,10 +1,3 @@
-import kagglehub
-
-# Download latest version
-path = kagglehub.dataset_download("jonathanoheix/face-expression-recognition-dataset")
-
-print("Path to dataset files:", path)
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -52,22 +45,20 @@ class PDELayer(nn.Module):
 
         self.alpha_w1 = nn.Parameter(torch.tensor(0.1))
         self.alpha_w2 = nn.Parameter(torch.tensor(0.1))
-        # self.alpha_w3 = nn.Parameter(torch.tensor(0.1))
+        self.alpha_w3 = nn.Parameter(torch.tensor(0.1))
         self.beta_w1 = nn.Parameter(torch.tensor(0.3))
         self.beta_w2 = nn.Parameter(torch.tensor(0.2))
-        # self.beta_w3 = nn.Parameter(torch.tensor(0.2))
+        self.beta_w3 = nn.Parameter(torch.tensor(0.2))
 
         # Register as buffers so they move with the model to GPU
         self.register_buffer('x', torch.linspace(0, Lx, Nx))
         self.register_buffer('y', torch.linspace(0, Ly, Ny))
 
     def alpha(self, y_val):
-        # return 0.5 * self.dt * (self.alpha_w1 + self.alpha_w2 * torch.sin(2 * torch.pi * y_val) + self.alpha_w3 * torch.sin(4 * torch.pi * y_val)) / self.dx**2
-        return 0.5 * self.dt * (self.alpha_w1 + self.alpha_w2 * torch.sin(2 * torch.pi * y_val)) / self.dx**2
+        return 0.5 * self.dt * (self.alpha_w1 + self.alpha_w2 * torch.sin(2 * torch.pi * y_val) + self.alpha_w3 * torch.sin(4 * torch.pi * y_val)) / self.dx**2
 
     def beta(self, x_val):
-        # return self.dt * (self.beta_w1 + self.beta_w2 * torch.cos(2 * torch.pi * x_val)+ self.beta_w3 * torch.cos(4 * torch.pi * x_val)) / self.dy**2
-        return self.dt * (self.beta_w1 + self.beta_w2 * torch.cos(2 * torch.pi * x_val)) / self.dy**2
+        return self.dt * (self.beta_w1 + self.beta_w2 * torch.cos(2 * torch.pi * x_val)+ self.beta_w3 * torch.cos(4 * torch.pi * x_val)) / self.dy**2
 
     def forward(self, u0):
         u = u0.squeeze(1)  # (B, 48, 48)
@@ -104,7 +95,7 @@ class EmotionDataset(Dataset):
         split_dir = os.path.join(root_dir, 'images', split)
         if not os.path.exists(split_dir):
             # Try alternative split names
-            possible_splits = ['validation', 'val', 'train', 'test']
+            possible_splits = ['test', 'val', 'train', 'validation']
             split_dir = None
             for alt_split in possible_splits:
                 alt_path = os.path.join(root_dir, 'images', alt_split)
@@ -191,8 +182,8 @@ def train(model, device, train_loader, optimizer, criterion, epoch):
         correct += predicted.eq(labels).sum().item()
         total += labels.size(0)
     print(f"Epoch {epoch+1}: Loss={total_loss/total:.4f}, Accuracy={100*correct/total:.2f}%")
-    print(f"  alpha_w1={model.pde.alpha_w1.item():.4f}, alpha_w2={model.pde.alpha_w2.item():.4f}")
-    print(f"  beta_w1= {model.pde.beta_w1.item():.4f}, beta_w2= {model.pde.beta_w2.item():.4f}")
+    print(f"  alpha_w1={model.pde.alpha_w1.item():.4f}, alpha_w2={model.pde.alpha_w2.item():.4f},alpha_w3={model.pde.alpha_w3.item():.4f}")
+    print(f"  beta_w1= {model.pde.beta_w1.item():.4f}, beta_w2= {model.pde.beta_w2.item():.4f}, beta_w3= {model.pde.beta_w3.item():.4f}")
 
 def evaluate(model, device, test_loader):
     model.eval()
@@ -207,11 +198,12 @@ def evaluate(model, device, test_loader):
     print(f"Test Accuracy: {100*correct/total:.2f}%")
 
 
-def main(path):
+def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    dataset_path = path
+    # Check available files in the dataset directory
+    dataset_path = "/kaggle/input/face-expression-recognition-dataset"
     print(f"Checking files in {dataset_path}:")
     try:
         files = os.listdir(dataset_path)
@@ -238,26 +230,28 @@ def main(path):
     transform = transforms.Compose([transforms.ToTensor()])
 
     try:
-        # Load full training dataset
-        full_train_dataset = EmotionDataset(dataset_path, split='train', transform=transform)
-        print(f"Full training dataset loaded: {len(full_train_dataset)} images")
+        # Try to create datasets with image folder structure
+        train_dataset = EmotionDataset(dataset_path, split='train', transform=transform)
+        print(f"Train dataset loaded: {len(train_dataset)} images")
 
-        # Split training dataset: 20,000 train + 8,821 for test extension
-        train_size = len(full_train_dataset) - 8821
-        extra_test_size = 8821
-        train_dataset, extra_test_dataset = torch.utils.data.random_split(
-            full_train_dataset, [train_size, extra_test_size],
-            generator=torch.Generator().manual_seed(42)
-        )
-        print(f"Split into {len(train_dataset)} training and {len(extra_test_dataset)} extra test samples")
+        # Try different splits for test data
+        test_splits = ['test', 'validation', 'val']
+        test_dataset = None
+        for test_split in test_splits:
+            try:
+                test_dataset = EmotionDataset(dataset_path, split=test_split, transform=transform)
+                print(f"Test dataset loaded from '{test_split}': {len(test_dataset)} images")
+                break
+            except:
+                continue
 
-        # Load validation (existing test) dataset
-        validation_dataset = EmotionDataset(dataset_path, split='validation', transform=transform)
-        print(f"Validation dataset loaded: {len(validation_dataset)} images")
-
-        # Combine validation and extra test data
-        combined_test_dataset = torch.utils.data.ConcatDataset([validation_dataset, extra_test_dataset])
-        print(f"Combined test dataset has {len(combined_test_dataset)} images")
+        if test_dataset is None or len(test_dataset) == 0:
+            print("No test dataset found, using 20% of train data for testing")
+            train_size = int(0.8 * len(train_dataset))
+            test_size = len(train_dataset) - train_size
+            train_dataset, test_dataset = torch.utils.data.random_split(
+                train_dataset, [train_size, test_size]
+            )
 
     except Exception as e:
         print(f"Error loading dataset: {e}")
@@ -268,13 +262,13 @@ def main(path):
         return
 
     train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
-    test_loader = DataLoader(combined_test_dataset, batch_size=128, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
 
     model = DiffusionClassifier(img_size=48, num_classes=7).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-    print(f"Starting training with {len(train_dataset)} training samples and {len(combined_test_dataset)} test samples")
+    print(f"Starting training with {len(train_dataset)} training samples and {len(test_dataset)} test samples")
 
     for epoch in range(70):
         train(model, device, train_loader, optimizer, criterion, epoch)
@@ -283,19 +277,15 @@ def main(path):
 
     # Visualize 5 random predictions
     model.eval()
-    indices = random.sample(range(len(combined_test_dataset)), min(5, len(combined_test_dataset)))
+    indices = random.sample(range(len(test_dataset)), min(5, len(test_dataset)))
 
-    # Handle both ConcatDataset and regular dataset
-    images = []
-    labels = []
-
-    for idx in indices:
-        img, label = combined_test_dataset[idx]
-        images.append(img)
-        labels.append(label)
-
-    images = torch.stack(images).to(device)
-    labels = torch.tensor(labels)
+    # Handle both regular dataset and subset (from random_split)
+    if hasattr(test_dataset, 'dataset'):  # It's a subset
+        images = torch.stack([test_dataset.dataset[test_dataset.indices[i]][0] for i in range(len(indices))]).to(device)
+        labels = torch.tensor([test_dataset.dataset[test_dataset.indices[i]][1] for i in range(len(indices))])
+    else:  # It's a regular dataset
+        images = torch.stack([test_dataset[i][0] for i in indices]).to(device)
+        labels = torch.tensor([test_dataset[i][1] for i in indices])
 
     with torch.no_grad():
         preds = model(images).argmax(dim=1).cpu()
@@ -312,9 +302,5 @@ def main(path):
     plt.tight_layout()
     plt.show()
 
-
 if __name__ == "__main__":
-    path = kagglehub.dataset_download("jonathanoheix/face-expression-recognition-dataset")
-    print("Path to dataset files:", path)
-    main(path)
-
+    main()
