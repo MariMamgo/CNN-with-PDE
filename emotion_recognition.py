@@ -225,40 +225,16 @@ def find_dataset_path():
     
     return None
 
-def main(dataset_path=None):
+def main(path):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-
-    # Use provided dataset path or try to find one automatically
-    if dataset_path is None:
-        dataset_path = find_dataset_path()
-        if dataset_path is None:
-            print("Dataset not found in any of the expected locations.")
-            print("Please provide dataset path as parameter: main('/path/to/your/dataset')")
-            print("Expected locations checked:")
-            possible_paths = [
-                "/kaggle/input/face-expression-recognition-dataset",
-                "/kaggle/input/fer2013",
-                "/kaggle/input/emotion-detection-fer",
-                "./data",
-                "./face-expression-recognition-dataset",
-                "./fer2013",
-                "../data",
-                "../face-expression-recognition-dataset"
-            ]
-            for path in possible_paths:
-                print(f"  - {path}")
-            return
     
-    if not os.path.exists(dataset_path):
-        print(f"Error: Dataset path '{dataset_path}' does not exist!")
-        return
+    dataset_path = path
+    print(f"Checking files in {dataset_path}:")
     
     transform = transforms.Compose([transforms.ToTensor()])
 
     try:
-        # Check available files in the dataset directory
-        print(f"Checking files in {dataset_path}:")
         files = os.listdir(dataset_path)
         print("Available files:", files)
 
@@ -350,9 +326,17 @@ def main(dataset_path=None):
     plt.show()
 
 if __name__ == "__main__":
-    # Example usage:
-    # main()  # Auto-detect dataset path
-    # main("/path/to/your/dataset")  # Specify dataset path
-    # main("/kaggle/input/face-expression-recognition-dataset")  # Kaggle path
-    
-    main()  # Try auto-detection first
+    if kagglehub is not None:
+        try:
+            print("Downloading dataset from Kaggle...")
+            path = kagglehub.dataset_download("jonathanoheix/face-expression-recognition-dataset")
+            print("Path to dataset files:", path)
+            main(path)
+        except Exception as e:
+            print(f"Error downloading dataset: {e}")
+            print("Trying auto-detection...")
+            main()
+    else:
+        print("kagglehub not available, trying auto-detection...")
+        print("Install kagglehub with: pip install kagglehub")
+        main()
