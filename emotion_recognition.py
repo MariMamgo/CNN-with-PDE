@@ -8,13 +8,10 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import random
 import os
-
-# Import kagglehub for dataset download
-try:
-    import kagglehub
-except ImportError:
-    print("kagglehub not installed. Install with: pip install kagglehub")
-    kagglehub = None
+import kagglehub
+from torch.optim.lr_scheduler import StepLR, CosineAnnealingLR
+from sklearn.metrics import classification_report, confusion_matrix
+import seaborn as sns
 
 # Import transforms explicitly
 try:
@@ -38,9 +35,24 @@ except ImportError:
                 return img
             return compose
 
+        @staticmethod
+        def RandomHorizontalFlip(p=0.5):
+            def flip(img):
+                if random.random() < p:
+                    return transforms.functional.hflip(img)
+                return img
+            return flip
+
+        @staticmethod
+        def RandomRotation(degrees):
+            def rotate(img):
+                angle = random.uniform(-degrees, degrees)
+                return transforms.functional.rotate(img, angle)
+            return rotate
+
     transforms = BasicTransforms()
 
-#PDE Layer (corrected device handling)
+#PDE Layer (UNCHANGED - same mathematical model)
 class PDELayer(nn.Module):
     def __init__(self, Nx=48, Ny=48, Lx=1.0, Ly=1.0, T=0.01, dt=0.001):
         super().__init__()
@@ -84,13 +96,14 @@ class PDELayer(nn.Module):
 
         return u[:, 1:-1, 1:-1].unsqueeze(1)  # (B, 1, 48, 48)
 
-#Emotion Dataset Loader for Image Folders
+#Improved Emotion Dataset with Data Augmentation
 class EmotionDataset(Dataset):
-    def __init__(self, root_dir, split='train', transform=None):
+    def __init__(self, root_dir, split='train', transform=None, balance_classes=False):
         self.root_dir = root_dir
         self.transform = transform
         self.images = []
         self.labels = []
+        self.balance_classes = balance_classes
 
         # Define emotion mapping
         self.emotion_to_idx = {
@@ -141,6 +154,31 @@ class EmotionDataset(Dataset):
                         self.images.append(os.path.join(emotion_path, img_file))
                         self.labels.append(emotion_idx)
 
+        # Balance classes if requested
+        if self.balance_classes:
+            self._balance_dataset()
+
+    def _balance_dataset(self):
+        # Count samples per class
+        from collections import Counter
+        label_counts = Counter(self.labels)
+        min_count = min(label_counts.values())
+        
+        # Keep only min_count samples per class
+        balanced_images = []
+        balanced_labels = []
+        class_counts = {i: 0 for i in range(7)}
+        
+        for img, label in zip(self.images, self.labels):
+            if class_counts[label] < min_count:
+                balanced_images.append(img)
+                balanced_labels.append(label)
+                class_counts[label] += 1
+        
+        self.images = balanced_images
+        self.labels = balanced_labels
+        print(f"Balanced dataset: {len(self.images)} images total")
+
     def __len__(self):
         return len(self.images)
 
@@ -158,44 +196,72 @@ class EmotionDataset(Dataset):
         label = self.labels[idx]
         return img, label
 
-#Updated Model
+#Improved Model with Better Classifier
 class DiffusionClassifier(nn.Module):
-    def __init__(self, img_size=48, num_classes=7):
+    def __init__(self, img_size=48, num_classes=7, dropout_rate=0.3):
         super().__init__()
-        self.pde = PDELayer(Nx=img_size, Ny=img_size)
+        self.pde = PDELayer(Nx=img_size, Ny=img_size)  # Keep PDE layer unchanged
+        
+        # Improved classifier with batch normalization and dropout
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(img_size * img_size, 128),
+            nn.Linear(img_size * img_size, 512),
+            nn.BatchNorm1d(512),
             nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
             nn.Linear(128, num_classes)
         )
 
     def forward(self, x):
-        x = self.pde(x)
+        x = self.pde(x)  # PDE layer unchanged
         return self.classifier(x)
 
-# Training and Evaluation Utilities
-def train(model, device, train_loader, optimizer, criterion, epoch):
+# Improved Training with Better Monitoring
+def train_epoch(model, device, train_loader, optimizer, criterion, epoch):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
-    for images, labels in train_loader:
+    for batch_idx, (images, labels) in enumerate(train_loader):
         images, labels = images.to(device), labels.to(device)
         outputs = model(images)
         loss = criterion(outputs, labels)
+        
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        
         total_loss += loss.item() * images.size(0)
         _, predicted = outputs.max(1)
         correct += predicted.eq(labels).sum().item()
         total += labels.size(0)
-    print(f"Epoch {epoch+1}: Loss={total_loss/total:.4f}, Accuracy={100*correct/total:.2f}%")
-    print(f"  alpha_w1={model.pde.alpha_w1.item():.4f}, alpha_w2={model.pde.alpha_w2.item():.4f},alpha_w3={model.pde.alpha_w3.item():.4f}")
-    print(f"  beta_w1= {model.pde.beta_w1.item():.4f}, beta_w2= {model.pde.beta_w2.item():.4f}, beta_w3= {model.pde.beta_w3.item():.4f}")
+        
+        # Print progress every 100 batches
+        if batch_idx % 100 == 0:
+            print(f'Epoch {epoch+1}, Batch {batch_idx}/{len(train_loader)}, '
+                  f'Loss: {loss.item():.4f}, Acc: {100*correct/total:.2f}%')
+    
+    avg_loss = total_loss / total
+    accuracy = 100 * correct / total
+    
+    print(f"Epoch {epoch+1}: Loss={avg_loss:.4f}, Accuracy={accuracy:.2f}%")
+    print(f"  alpha_w1={model.pde.alpha_w1.item():.4f}, alpha_w2={model.pde.alpha_w2.item():.4f}, alpha_w3={model.pde.alpha_w3.item():.4f}")
+    print(f"  beta_w1={model.pde.beta_w1.item():.4f}, beta_w2={model.pde.beta_w2.item():.4f}, beta_w3={model.pde.beta_w3.item():.4f}")
+    
+    return avg_loss, accuracy
 
-def evaluate(model, device, test_loader):
+def evaluate(model, device, test_loader, emotion_names):
     model.eval()
     correct, total = 0, 0
+    all_predictions = []
+    all_labels = []
+    
     with torch.no_grad():
         for images, labels in test_loader:
             images, labels = images.to(device), labels.to(device)
@@ -203,27 +269,28 @@ def evaluate(model, device, test_loader):
             _, predicted = outputs.max(1)
             correct += predicted.eq(labels).sum().item()
             total += labels.size(0)
-    print(f"Test Accuracy: {100*correct/total:.2f}%")
-
-def find_dataset_path():
-    """Find the dataset path by checking multiple possible locations"""
-    possible_paths = [
-        "/kaggle/input/face-expression-recognition-dataset",
-        "/kaggle/input/fer2013",
-        "/kaggle/input/emotion-detection-fer",
-        "./data",
-        "./face-expression-recognition-dataset",
-        "./fer2013",
-        "../data",
-        "../face-expression-recognition-dataset"
-    ]
+            
+            all_predictions.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
     
-    for path in possible_paths:
-        if os.path.exists(path):
-            print(f"Found dataset at: {path}")
-            return path
+    accuracy = 100 * correct / total
+    print(f"Test Accuracy: {accuracy:.2f}%")
     
-    return None
+    # Detailed classification report
+    print("\nDetailed Classification Report:")
+    print(classification_report(all_labels, all_predictions, target_names=emotion_names))
+    
+    # Confusion matrix
+    cm = confusion_matrix(all_labels, all_predictions)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=emotion_names, yticklabels=emotion_names)
+    plt.title('Confusion Matrix')
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.show()
+    
+    return accuracy
 
 def main(path):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -232,7 +299,16 @@ def main(path):
     dataset_path = path
     print(f"Checking files in {dataset_path}:")
     
-    transform = transforms.Compose([transforms.ToTensor()])
+    # Improved data augmentation
+    train_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.RandomHorizontalFlip(0.5),
+        transforms.RandomRotation(10)
+    ])
+    
+    test_transform = transforms.Compose([
+        transforms.ToTensor()
+    ])
 
     try:
         files = os.listdir(dataset_path)
@@ -245,15 +321,9 @@ def main(path):
             subdirs = os.listdir(images_path)
             print("Subdirectories:", subdirs)
 
-            # Check deeper structure
-            for subdir in subdirs[:3]:  # Check first 3 subdirectories
-                subdir_path = os.path.join(images_path, subdir)
-                if os.path.isdir(subdir_path):
-                    contents = os.listdir(subdir_path)
-                    print(f"Contents of {subdir}: {contents[:5]}...")  # Show first 5 items
-
-        # Try to create datasets with image folder structure
-        train_dataset = EmotionDataset(dataset_path, split='train', transform=transform)
+        # Create datasets with improvements
+        train_dataset = EmotionDataset(dataset_path, split='train', 
+                                     transform=train_transform, balance_classes=True)
         print(f"Train dataset loaded: {len(train_dataset)} images")
 
         # Try different splits for test data
@@ -261,7 +331,8 @@ def main(path):
         test_dataset = None
         for test_split in test_splits:
             try:
-                test_dataset = EmotionDataset(dataset_path, split=test_split, transform=transform)
+                test_dataset = EmotionDataset(dataset_path, split=test_split, 
+                                            transform=test_transform)
                 if len(test_dataset) > 0:
                     print(f"Test dataset loaded from '{test_split}': {len(test_dataset)} images")
                     break
@@ -284,19 +355,74 @@ def main(path):
         print("No training data found! Please check your dataset structure.")
         return
 
-    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
+    # Improved data loaders
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, 
+                             num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, 
+                            num_workers=4, pin_memory=True)
 
-    model = DiffusionClassifier(img_size=48, num_classes=7).to(device)
+    # Improved model with dropout
+    model = DiffusionClassifier(img_size=48, num_classes=7, dropout_rate=0.3).to(device)
+    
+    # Better optimizer and loss function
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
+    scheduler = CosineAnnealingLR(optimizer, T_max=70, eta_min=1e-6)
 
     print(f"Starting training with {len(train_dataset)} training samples and {len(test_dataset)} test samples")
 
-    for epoch in range(70):
-        train(model, device, train_loader, optimizer, criterion, epoch)
+    # Training with early stopping
+    best_accuracy = 0
+    patience = 10
+    patience_counter = 0
+    
+    train_losses = []
+    train_accuracies = []
 
-    evaluate(model, device, test_loader)
+    for epoch in range(70):
+        loss, acc = train_epoch(model, device, train_loader, optimizer, criterion, epoch)
+        train_losses.append(loss)
+        train_accuracies.append(acc)
+        
+        scheduler.step()
+        
+        # Evaluate every 5 epochs
+        if (epoch + 1) % 5 == 0:
+            emotion_names = ['Angry', 'Disgust', 'Fear', 'Happy', 'Sad', 'Surprise', 'Neutral']
+            test_acc = evaluate(model, device, test_loader, emotion_names)
+            
+            # Early stopping
+            if test_acc > best_accuracy:
+                best_accuracy = test_acc
+                patience_counter = 0
+                # Save best model
+                torch.save(model.state_dict(), 'best_model.pth')
+            else:
+                patience_counter += 1
+                
+            if patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch+1}")
+                break
+
+    # Final evaluation
+    emotion_names = ['Angry', 'Disgust', 'Fear', 'Happy', 'Sad', 'Surprise', 'Neutral']
+    final_accuracy = evaluate(model, device, test_loader, emotion_names)
+
+    # Plot training curves
+    plt.figure(figsize=(12, 4))
+    plt.subplot(1, 2, 1)
+    plt.plot(train_losses)
+    plt.title('Training Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(train_accuracies)
+    plt.title('Training Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy (%)')
+    plt.tight_layout()
+    plt.show()
 
     # Visualize 5 random predictions
     model.eval()
@@ -313,7 +439,6 @@ def main(path):
     with torch.no_grad():
         preds = model(images).argmax(dim=1).cpu()
 
-    emotion_names = ['Angry', 'Disgust', 'Fear', 'Happy', 'Sad', 'Surprise', 'Neutral']
     fig, axes = plt.subplots(1, len(indices), figsize=(3*len(indices), 3))
     if len(indices) == 1:
         axes = [axes]
@@ -326,17 +451,6 @@ def main(path):
     plt.show()
 
 if __name__ == "__main__":
-    if kagglehub is not None:
-        try:
-            print("Downloading dataset from Kaggle...")
-            path = kagglehub.dataset_download("jonathanoheix/face-expression-recognition-dataset")
-            print("Path to dataset files:", path)
-            main(path)
-        except Exception as e:
-            print(f"Error downloading dataset: {e}")
-            print("Trying auto-detection...")
-            main()
-    else:
-        print("kagglehub not available, trying auto-detection...")
-        print("Install kagglehub with: pip install kagglehub")
-        main()
+    path = kagglehub.dataset_download("jonathanoheix/face-expression-recognition-dataset")
+    print("Path to dataset files:", path)
+    main(path)
