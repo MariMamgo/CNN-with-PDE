@@ -9,6 +9,13 @@ import matplotlib.pyplot as plt
 import random
 import os
 
+# Import kagglehub for dataset download
+try:
+    import kagglehub
+except ImportError:
+    print("kagglehub not installed. Install with: pip install kagglehub")
+    kagglehub = None
+
 # Import transforms explicitly
 try:
     import torchvision.transforms as transforms
@@ -310,7 +317,7 @@ def main(dataset_path=None):
 
     print(f"Starting training with {len(train_dataset)} training samples and {len(test_dataset)} test samples")
 
-    for epoch in range(10):  # Reduced epochs for testing
+    for epoch in range(70):
         train(model, device, train_loader, optimizer, criterion, epoch)
 
     evaluate(model, device, test_loader)
@@ -343,4 +350,9 @@ def main(dataset_path=None):
     plt.show()
 
 if __name__ == "__main__":
-    main()
+    # Example usage:
+    # main()  # Auto-detect dataset path
+    # main("/path/to/your/dataset")  # Specify dataset path
+    # main("/kaggle/input/face-expression-recognition-dataset")  # Kaggle path
+    
+    main()  # Try auto-detection first
