@@ -216,102 +216,90 @@ def find_dataset_path():
             print(f"Found dataset at: {path}")
             return path
     
-    print("Dataset not found in any of the expected locations.")
-    print("Please ensure your dataset is placed in one of these locations:")
-    for path in possible_paths:
-        print(f"  - {path}")
-    print("\nOr update the dataset_path variable in the main() function.")
     return None
 
-def create_synthetic_data(num_samples=1000):
-    """Create synthetic emotion data for testing when real dataset is not available"""
-    print("Creating synthetic dataset for testing...")
-    
-    class SyntheticEmotionDataset(Dataset):
-        def __init__(self, num_samples, transform=None):
-            self.num_samples = num_samples
-            self.transform = transform
-            
-        def __len__(self):
-            return self.num_samples
-            
-        def __getitem__(self, idx):
-            # Create random 48x48 grayscale image
-            img = torch.randn(1, 48, 48)
-            # Random emotion label (0-6)
-            label = random.randint(0, 6)
-            return img, label
-    
-    return SyntheticEmotionDataset(num_samples)
-
-def main():
+def main(dataset_path=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Find dataset path
-    dataset_path = find_dataset_path()
+    # Use provided dataset path or try to find one automatically
+    if dataset_path is None:
+        dataset_path = find_dataset_path()
+        if dataset_path is None:
+            print("Dataset not found in any of the expected locations.")
+            print("Please provide dataset path as parameter: main('/path/to/your/dataset')")
+            print("Expected locations checked:")
+            possible_paths = [
+                "/kaggle/input/face-expression-recognition-dataset",
+                "/kaggle/input/fer2013",
+                "/kaggle/input/emotion-detection-fer",
+                "./data",
+                "./face-expression-recognition-dataset",
+                "./fer2013",
+                "../data",
+                "../face-expression-recognition-dataset"
+            ]
+            for path in possible_paths:
+                print(f"  - {path}")
+            return
+    
+    if not os.path.exists(dataset_path):
+        print(f"Error: Dataset path '{dataset_path}' does not exist!")
+        return
     
     transform = transforms.Compose([transforms.ToTensor()])
 
-    if dataset_path is None:
-        print("Using synthetic data for demonstration...")
-        train_dataset = create_synthetic_data(800)
-        test_dataset = create_synthetic_data(200)
-    else:
-        try:
-            # Check available files in the dataset directory
-            print(f"Checking files in {dataset_path}:")
-            files = os.listdir(dataset_path)
-            print("Available files:", files)
+    try:
+        # Check available files in the dataset directory
+        print(f"Checking files in {dataset_path}:")
+        files = os.listdir(dataset_path)
+        print("Available files:", files)
 
-            # Check images directory structure
-            images_path = os.path.join(dataset_path, 'images')
-            if os.path.exists(images_path):
-                print(f"Contents of images directory:")
-                subdirs = os.listdir(images_path)
-                print("Subdirectories:", subdirs)
+        # Check images directory structure
+        images_path = os.path.join(dataset_path, 'images')
+        if os.path.exists(images_path):
+            print(f"Contents of images directory:")
+            subdirs = os.listdir(images_path)
+            print("Subdirectories:", subdirs)
 
-                # Check deeper structure
-                for subdir in subdirs[:3]:  # Check first 3 subdirectories
-                    subdir_path = os.path.join(images_path, subdir)
-                    if os.path.isdir(subdir_path):
-                        contents = os.listdir(subdir_path)
-                        print(f"Contents of {subdir}: {contents[:5]}...")  # Show first 5 items
+            # Check deeper structure
+            for subdir in subdirs[:3]:  # Check first 3 subdirectories
+                subdir_path = os.path.join(images_path, subdir)
+                if os.path.isdir(subdir_path):
+                    contents = os.listdir(subdir_path)
+                    print(f"Contents of {subdir}: {contents[:5]}...")  # Show first 5 items
 
-            # Try to create datasets with image folder structure
-            train_dataset = EmotionDataset(dataset_path, split='train', transform=transform)
-            print(f"Train dataset loaded: {len(train_dataset)} images")
+        # Try to create datasets with image folder structure
+        train_dataset = EmotionDataset(dataset_path, split='train', transform=transform)
+        print(f"Train dataset loaded: {len(train_dataset)} images")
 
-            # Try different splits for test data
-            test_splits = ['test', 'validation', 'val']
-            test_dataset = None
-            for test_split in test_splits:
-                try:
-                    test_dataset = EmotionDataset(dataset_path, split=test_split, transform=transform)
-                    if len(test_dataset) > 0:
-                        print(f"Test dataset loaded from '{test_split}': {len(test_dataset)} images")
-                        break
-                except:
-                    continue
+        # Try different splits for test data
+        test_splits = ['test', 'validation', 'val']
+        test_dataset = None
+        for test_split in test_splits:
+            try:
+                test_dataset = EmotionDataset(dataset_path, split=test_split, transform=transform)
+                if len(test_dataset) > 0:
+                    print(f"Test dataset loaded from '{test_split}': {len(test_dataset)} images")
+                    break
+            except:
+                continue
 
-            if test_dataset is None or len(test_dataset) == 0:
-                print("No test dataset found, using 20% of train data for testing")
-                train_size = int(0.8 * len(train_dataset))
-                test_size = len(train_dataset) - train_size
-                train_dataset, test_dataset = torch.utils.data.random_split(
-                    train_dataset, [train_size, test_size]
-                )
+        if test_dataset is None or len(test_dataset) == 0:
+            print("No test dataset found, using 20% of train data for testing")
+            train_size = int(0.8 * len(train_dataset))
+            test_size = len(train_dataset) - train_size
+            train_dataset, test_dataset = torch.utils.data.random_split(
+                train_dataset, [train_size, test_size]
+            )
 
-        except Exception as e:
-            print(f"Error loading dataset: {e}")
-            print("Using synthetic data for demonstration...")
-            train_dataset = create_synthetic_data(800)
-            test_dataset = create_synthetic_data(200)
+    except Exception as e:
+        print(f"Error loading dataset: {e}")
+        return
 
     if len(train_dataset) == 0:
-        print("No training data found! Using synthetic data...")
-        train_dataset = create_synthetic_data(800)
-        test_dataset = create_synthetic_data(200)
+        print("No training data found! Please check your dataset structure.")
+        return
 
     train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
@@ -322,7 +310,7 @@ def main():
 
     print(f"Starting training with {len(train_dataset)} training samples and {len(test_dataset)} test samples")
 
-    for epoch in range(70):  # Reduced epochs for testing
+    for epoch in range(10):  # Reduced epochs for testing
         train(model, device, train_loader, optimizer, criterion, epoch)
 
     evaluate(model, device, test_loader)
