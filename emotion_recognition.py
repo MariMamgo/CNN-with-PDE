@@ -322,7 +322,7 @@ def main():
 
     print(f"Starting training with {len(train_dataset)} training samples and {len(test_dataset)} test samples")
 
-    for epoch in range(10):  # Reduced epochs for testing
+    for epoch in range(70):  # Reduced epochs for testing
         train(model, device, train_loader, optimizer, criterion, epoch)
 
     evaluate(model, device, test_loader)
